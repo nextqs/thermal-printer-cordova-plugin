@@ -1,5 +1,5 @@
 {
-  "name": "thermal-printer-cordova-plugin",
+  "name": "nxtqs-thermal-printer-cordova-plugin",
   "version": "1.0.9",
   "description": "Cordova wrapper for ESC/POS Thermal Printer library",
   "repository": {
