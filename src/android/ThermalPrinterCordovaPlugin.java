@@ -1,6 +1,6 @@
 package de.paystory.thermal_printer;
 
-import static android.app.PendingIntent.FLAG_MUTABLE;
+import static android.app.PendingIntent.FLAG_IMMUTABLE;
 
 import android.Manifest;
 import android.app.PendingIntent;
@@ -101,7 +101,7 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                 cordova.getActivity().getBaseContext(),
                 0,
                 new Intent(intentName),
-                FLAG_MUTABLE
+                FLAG_IMMUTABLE
             );
 
             ArrayList<BroadcastReceiver> broadcastReceiverArrayList = new ArrayList<>();
