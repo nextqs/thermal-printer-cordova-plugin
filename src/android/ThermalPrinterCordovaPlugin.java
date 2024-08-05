@@ -1,6 +1,6 @@
 package de.paystory.thermal_printer;
 
-import static android.app.PendingIntent.FLAG_IMMUTABLE;
+import static android.app.PendingIntent.FLAG_MUTABLE;
 
 import android.Manifest;
 import android.app.PendingIntent;
@@ -92,59 +92,67 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
         }
     }
 
-    private void requestUSBPermissions(CallbackContext callbackContext, JSONObject data) throws JSONException {
-        DeviceConnection connection = ThermalPrinterCordovaPlugin.this.getPrinterConnection(callbackContext, data);
-        if (connection != null) {
-            String intentName = "thermalPrinterUSBRequest" + ((UsbConnection) connection).getDevice().getDeviceId();
+  private void requestUSBPermissions(CallbackContext callbackContext, JSONObject data) throws JSONException {
+    DeviceConnection connection = ThermalPrinterCordovaPlugin.this.getPrinterConnection(callbackContext, data);
+    if (connection != null) {
+      String intentName = "thermalPrinterUSBRequest" + ((UsbConnection) connection).getDevice().getDeviceId();
 
-            PendingIntent permissionIntent = PendingIntent.getBroadcast(
-                cordova.getActivity().getBaseContext(),
-                0,
-                new Intent(intentName),
-                FLAG_IMMUTABLE
-            );
+      Intent explicitIntent = new Intent(intentName);
+      explicitIntent.setPackage(cordova.getActivity().getPackageName()); // Make the Intent explicit
+      PendingIntent permissionIntent = PendingIntent.getBroadcast(
+        cordova.getActivity().getBaseContext(),
+        0,
+        explicitIntent,
+        FLAG_MUTABLE
+      );
 
-            ArrayList<BroadcastReceiver> broadcastReceiverArrayList = new ArrayList<>();
-            BroadcastReceiver broadcastReceiver = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
-                    String action = intent.getAction();
-                    if (action != null && action.equals(intentName)) {
-                        for (BroadcastReceiver br : broadcastReceiverArrayList) {
-                            if (br != null) {
-                                cordova.getActivity().unregisterReceiver(br);
-                            }
-                        }
-                        synchronized (this) {
-                            UsbManager usbManager = (UsbManager) ThermalPrinterCordovaPlugin.this.cordova.getActivity().getSystemService(Context.USB_SERVICE);
-                            UsbDevice usbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-                            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
-                                if (usbManager != null && usbDevice != null) {
-                                    callbackContext.success(new JSONObject(new HashMap<String, Object>() {{
-                                        put("granted", true);
-                                    }}));
-                                    return;
-                                }
-                            }
-                            callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
-                                put("granted", false);
-                            }}));
-                        }
-                    }
-                }
-            };
-
-            IntentFilter filter = new IntentFilter(intentName);
-            cordova.getActivity().registerReceiver(broadcastReceiver, filter);
-            broadcastReceiverArrayList.add(broadcastReceiver);
-
-            UsbManager usbManager = (UsbManager) this.cordova.getActivity().getSystemService(Context.USB_SERVICE);
-            if (usbManager != null) {
-                usbManager.requestPermission(((UsbConnection) connection).getDevice(), permissionIntent);
+      ArrayList<BroadcastReceiver> broadcastReceiverArrayList = new ArrayList<>();
+      BroadcastReceiver broadcastReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+          String action = intent.getAction();
+          if (action != null && action.equals(intentName)) {
+            for (BroadcastReceiver br : broadcastReceiverArrayList) {
+              if (br != null) {
+                cordova.getActivity().unregisterReceiver(br);
+              }
             }
+            synchronized (this) {
+              UsbManager usbManager = (UsbManager) ThermalPrinterCordovaPlugin.this.cordova.getActivity().getSystemService(Context.USB_SERVICE);
+              UsbDevice usbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+              if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                if (usbManager != null && usbDevice != null) {
+                  callbackContext.success(new JSONObject(new HashMap<String, Object>() {{
+                    put("granted", true);
+                  }}));
+                  return;
+                }
+              }
+              callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
+                put("granted", false);
+              }}));
+            }
+          }
         }
-    }
+      };
 
+      IntentFilter filter = new IntentFilter(intentName);
+
+     // Use the appropriate method to register the BroadcastReceiver according to the API version
+      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {  // TIRAMISU is Android 13 / API 33
+        cordova.getActivity().registerReceiver(broadcastReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+      } else {
+        cordova.getActivity().registerReceiver(broadcastReceiver, filter);
+      }
+
+      broadcastReceiverArrayList.add(broadcastReceiver);
+
+      UsbManager usbManager = (UsbManager) this.cordova.getActivity().getSystemService(Context.USB_SERVICE);
+      if (usbManager != null) {
+        usbManager.requestPermission(((UsbConnection) connection).getDevice(), permissionIntent);
+      }
+    }
+  }
     private void listPrinters(CallbackContext callbackContext, JSONObject data) throws JSONException {
         JSONArray printers = new JSONArray();
 
