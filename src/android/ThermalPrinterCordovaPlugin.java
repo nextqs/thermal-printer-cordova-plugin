@@ -205,7 +205,14 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
 
     private void printFormattedText(CallbackContext callbackContext, String action, JSONObject data) throws JSONException {
         EscPosPrinter printer = this.getPrinter(callbackContext, data);
-        try {
+            try {
+                // Read printerModel parameter (optional)
+                String printerModel = data.optString("printerModel", "");            // Enable automatic slicing for Gertec printers
+            if ("gertec".equalsIgnoreCase(printerModel)) {
+                printer.setImageSlicing(true);
+                printer.setImageSliceLinesPerStrip(20);
+            }
+            
             int dotsFeedPaper = data.has("mmFeedPaper")
                 ? printer.mmToPx((float) data.getDouble("mmFeedPaper"))
                 : data.optInt("dotsFeedPaper", 20);

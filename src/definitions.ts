@@ -28,6 +28,7 @@ export interface PrintFormattedText extends PrinterToUse {
     printerDpi?: number;
     printerWidthMM?: number;
     printerNbrCharactersPerLine?: number;
+    printerModel?: string;
     charsetEncoding?: {
         charsetName: string,
         charsetId: number
