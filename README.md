@@ -1,5 +1,5 @@
 ## Cordova Plugin for Thermal Printer's
-[![npm version](https://img.shields.io/npm/v/thermal-printer-cordova-plugin.svg)](https://www.npmjs.com/package/thermal-printer-cordova-plugin) [![npm downloads](https://img.shields.io/npm/dm/thermal-printer-cordova-plugin.svg)](https://www.npmjs.com/package/thermal-printer-cordova-plugin)
+[![npm version](https://img.shields.io/npm/v/nxtqs-thermal-printer-cordova-plugin.svg)](https://www.npmjs.com/package/nxtqs-thermal-printer-cordova-plugin) [![npm downloads](https://img.shields.io/npm/dm/nxtqs-thermal-printer-cordova-plugin.svg)](https://www.npmjs.com/package/nxtqs-thermal-printer-cordova-plugin)
 
 ---
 
@@ -9,15 +9,15 @@ This plugin is a wrapper for the [Android library for ESC/POS Thermal Printer](h
 
 #### Cordova
 
-    $ cordova plugin add thermal-printer-cordova-plugin
+    $ cordova plugin add nxtqs-thermal-printer-cordova-plugin
 
 #### Ionic
 
-    $ ionic cordova plugin add thermal-printer-cordova-plugin
+    $ ionic cordova plugin add nxtqs-thermal-printer-cordova-plugin
 
 #### Capacitor
 
-    $ npm install thermal-printer-cordova-plugin
+    $ npm install nxtqs-thermal-printer-cordova-plugin
     $ npx cap sync
 
 Don't forget to add BLUETOOTH and INTERNET (for TCP) permissions and for USB printers the `android.hardware.usb.host` feature to the `AndroidManifest.xml`.
@@ -35,7 +35,7 @@ Don't forget to add BLUETOOTH and INTERNET (for TCP) permissions and for USB pri
 You can easily import and use the ThermalPrinter plugin in your TypeScript-Projects.
 
 ```typescript
-import { ThermalPrinterPlugin } from 'thermal-printer-cordova-plugin/src';
+import { ThermalPrinterPlugin } from 'nxtqs-thermal-printer-cordova-plugin/src';
 
 declare let ThermalPrinter: ThermalPrinterPlugin;
 ```
