@@ -12,8 +12,10 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Paint;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
+import android.os.Build;
 import android.util.Base64;
 
 import com.dantsu.escposprinter.EscPosCharsetEncoding;
@@ -37,10 +39,35 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
+    private static final String INTERNAL_UROVO_TYPE = "internal-urovo";
+    private static final String INTERNAL_UROVO_ID = "internal-urovo";
+    private static final String INTERNAL_UROVO_NAME = "Gertec GPOS820";
+    private static final String PRINTER_MANAGER_CLASS = "android.device.PrinterManager";
+    private static final int INTERNAL_PAGE_WIDTH = 384;
+    private static final int INTERNAL_NO_ROTATE = 0;
+    private static final int INTERNAL_FONT_SIZE = 26;
+    private static final int INTERNAL_FONT_SIZE_SMALL = 22;
+    private static final int INTERNAL_FONT_SIZE_TITLE = 34;
+    private static final int INTERNAL_FONT_SIZE_TICKET = 72;
+    private static final int INTERNAL_LINE_GAP = 6;
+    private static final int INTERNAL_TEXT_HORIZONTAL_PADDING = 8;
+    private static final int INTERNAL_BARCODE_QRCODE = 58;
+    private static final int INTERNAL_QR_DEFAULT_SIZE = 280;
+    private static final int INTERNAL_QR_MIN_SIZE = 240;
+    private static final int INTERNAL_QR_MAX_SIZE = 320;
+    private static final int INTERNAL_QR_X_MAX = 240;
+    private static final int INTERNAL_LOGO_MAX_WIDTH = 220;
+    private static final int INTERNAL_LOGO_GAP = 12;
+    private static final int INTERNAL_WHITE_THRESHOLD = 245;
+    private static final int INTERNAL_BOTTOM_FEED = 120;
+
     private final HashMap<String, DeviceConnection> connections = new HashMap<>();
     private BroadcastReceiver usbDetachReceiver;
     private boolean isUsbReceiverRegistered = false;
@@ -156,6 +183,8 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                     ThermalPrinterCordovaPlugin.this.requestUSBPermissions(callbackContext, args.getJSONObject(0));
                 } else if (action.equals("bitmapToHexadecimalString")) {
                     ThermalPrinterCordovaPlugin.this.bitmapToHexadecimalString(callbackContext, args.getJSONObject(0));
+                } else if (action.equals("printInternalUrovoPage")) {
+                    ThermalPrinterCordovaPlugin.this.printInternalUrovoPage(callbackContext, args.getJSONObject(0));
                 }
             } catch (JSONException exception) {
                 callbackContext.error(exception.getMessage());
@@ -166,6 +195,14 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     }
 
     private void bitmapToHexadecimalString(CallbackContext callbackContext, JSONObject data) throws JSONException {
+        if (isInternalUrovo(data)) {
+            callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
+                put("error", "bitmapToHexadecimalString is not supported for internal-urovo printers");
+                put("type", INTERNAL_UROVO_TYPE);
+            }}));
+            return;
+        }
+
         String encodedString = data.getString("base64");
         byte[] decodedString = Base64.decode(encodedString.contains(",")
             ? encodedString.substring(encodedString.indexOf(",") + 1) : encodedString, Base64.DEFAULT);
@@ -188,6 +225,13 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     }
 
     private void requestUSBPermissions(CallbackContext callbackContext, JSONObject data) throws JSONException {
+        if (isInternalUrovo(data)) {
+            callbackContext.success(new JSONObject(new HashMap<String, Object>() {{
+                put("granted", true);
+            }}));
+            return;
+        }
+
         DeviceConnection connection = ThermalPrinterCordovaPlugin.this.getPrinterConnection(callbackContext, data);
         if (connection != null) {
             // Use stable key instead of deviceId (which changes after unplug/replug)
@@ -266,6 +310,22 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
         JSONArray printers = new JSONArray();
 
         String type = data.getString("type");
+        if (INTERNAL_UROVO_TYPE.equals(type)) {
+            if (hasInternalPrinterManager()) {
+                JSONObject printerObj = new JSONObject();
+                printerObj.put("id", INTERNAL_UROVO_ID);
+                printerObj.put("name", INTERNAL_UROVO_NAME);
+                printerObj.put("type", INTERNAL_UROVO_TYPE);
+                printerObj.put("manufacturer", Build.MANUFACTURER);
+                printerObj.put("brand", Build.BRAND);
+                printerObj.put("model", Build.MODEL);
+                printerObj.put("device", Build.DEVICE);
+                printers.put(printerObj);
+            }
+            callbackContext.success(printers);
+            return;
+        }
+
         if (type.equals("bluetooth")) {
             if (!this.cordova.hasPermission(Manifest.permission.BLUETOOTH)) {
                 callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
@@ -295,8 +355,9 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                 callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
                     put("error", errorMsg);
                 }}));
+                return;
             }
-        } else {
+        } else if (type.equals("usb")) {
             UsbConnections printerConnections = new UsbConnections(this.cordova.getActivity());
             for (UsbConnection usbConnection : printerConnections.getList()) {
                 UsbDevice usbDevice = usbConnection.getDevice();
@@ -309,12 +370,23 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                 try { printerObj.put("productId", usbDevice.getProductId()); } catch (Exception ignored) {}
                 printers.put(printerObj);
             }
+        } else {
+            callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
+                put("error", "Unsupported printer type: " + type);
+                put("type", type);
+            }}));
+            return;
         }
 
         callbackContext.success(printers);
     }
 
     private void printFormattedText(CallbackContext callbackContext, String action, JSONObject data) throws JSONException {
+        if (isInternalUrovo(data)) {
+            this.printInternalUrovoFormattedText(callbackContext, data);
+            return;
+        }
+
         EscPosPrinter printer = this.getPrinter(callbackContext, data);
         try {
             // Read printerModel parameter (optional)
@@ -352,6 +424,13 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     }
 
     private void getEncoding(CallbackContext callbackContext, JSONObject data) throws JSONException {
+        if (isInternalUrovo(data)) {
+            callbackContext.success(new JSONObject(new HashMap<String, Object>() {{
+                put("name", INTERNAL_UROVO_TYPE);
+            }}));
+            return;
+        }
+
         EscPosPrinter printer = this.getPrinter(callbackContext, data);
         callbackContext.success(new JSONObject(new HashMap<String, Object>() {{
             EscPosCharsetEncoding encoding = printer.getEncoding();
@@ -367,6 +446,11 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     }
 
     private void disconnectPrinter(CallbackContext callbackContext, JSONObject data) throws JSONException {
+        if (isInternalUrovo(data)) {
+            callbackContext.success();
+            return;
+        }
+
         EscPosPrinter printer = this.getPrinter(callbackContext, data);
         printer.disconnectPrinter();
         callbackContext.success();
@@ -374,6 +458,9 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
 
     private String buildConnectionKey(JSONObject data) throws JSONException {
         String type = data.getString("type");
+        if (INTERNAL_UROVO_TYPE.equals(type)) {
+            return INTERNAL_UROVO_TYPE + "-" + data.optString("id", INTERNAL_UROVO_ID);
+        }
         if (!"usb".equals(type)) {
             return type + "-" + data.optString("id");
         }
@@ -577,6 +664,627 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
         }
         
         return false;
+    }
+
+    private boolean isInternalUrovo(JSONObject data) {
+        return INTERNAL_UROVO_TYPE.equals(data.optString("type", ""));
+    }
+
+    private boolean hasInternalPrinterManager() {
+        try {
+            Class.forName(PRINTER_MANAGER_CLASS);
+            return true;
+        } catch (ClassNotFoundException error) {
+            return false;
+        }
+    }
+
+    private Object createInternalPrinterManager() throws Exception {
+        Class<?> printerManagerClass = Class.forName(PRINTER_MANAGER_CLASS);
+        return printerManagerClass.getConstructor().newInstance();
+    }
+
+    private void printInternalUrovoFormattedText(CallbackContext callbackContext, JSONObject data) throws JSONException {
+        InternalPrinterMethods methods = null;
+        try {
+            if (!hasInternalPrinterManager()) {
+                throw new IllegalStateException("Internal printer manager is not available");
+            }
+
+            Object printerManager = createInternalPrinterManager();
+            methods = new InternalPrinterMethods(printerManager);
+
+            int openResult = methods.open();
+            if (openResult != 0) {
+                throw new IllegalStateException("PrinterManager.open returned " + openResult);
+            }
+
+            int printStatus;
+            try {
+                methods.setupPage(INTERNAL_PAGE_WIDTH, -1);
+                methods.clearPage();
+
+                int y = 0;
+                drawInternalFormattedText(methods, data.getString("text"), y);
+                printStatus = methods.printPage(INTERNAL_NO_ROTATE);
+                if (printStatus != 0) {
+                    throw new IllegalStateException("PrinterManager.printPage returned " + printStatus);
+                }
+                methods.paperFeed(INTERNAL_BOTTOM_FEED);
+            } finally {
+                try {
+                    methods.close();
+                } catch (Exception closeError) {
+                    android.util.Log.w("ThermalPrinter", "Internal printer close failed: " + closeError.getMessage());
+                }
+            }
+
+            JSONObject result = new JSONObject();
+            result.put("status", printStatus);
+            callbackContext.success(result);
+        } catch (Exception e) {
+            final String errorMsg = e.getMessage() != null ? e.getMessage() : "Unknown internal printer error";
+            android.util.Log.e("ThermalPrinter", "Internal printer error: " + errorMsg, e);
+            callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
+                put("error", errorMsg);
+                put("type", INTERNAL_UROVO_TYPE);
+            }}));
+        }
+    }
+
+    private void printInternalUrovoPage(CallbackContext callbackContext, JSONObject data) throws JSONException {
+        InternalPrinterMethods methods = null;
+        try {
+            if (!hasInternalPrinterManager()) {
+                throw new IllegalStateException("Internal printer manager is not available");
+            }
+
+            Object printerManager = createInternalPrinterManager();
+            methods = new InternalPrinterMethods(printerManager);
+
+            int openResult = methods.open();
+            if (openResult != 0) {
+                throw new IllegalStateException("PrinterManager.open returned " + openResult);
+            }
+
+            int printStatus;
+            try {
+                methods.setupPage(INTERNAL_PAGE_WIDTH, -1);
+                methods.clearPage();
+
+                JSONArray operations = data.getJSONArray("operations");
+                int y = 0;
+                for (int i = 0; i < operations.length(); i++) {
+                    JSONObject op = operations.getJSONObject(i);
+                    String kind = op.getString("kind");
+                    int gap = op.optInt("gap", 0);
+
+                    if ("gap".equals(kind)) {
+                        y += op.optInt("dots", 0);
+
+                    } else if ("text".equals(kind)) {
+                        String text = op.optString("text", "").trim();
+                        if (text.isEmpty()) { y += INTERNAL_LINE_GAP; continue; }
+                        String align = op.optString("align", "left");
+                        boolean bold = op.optBoolean("bold", false);
+                        int fontSize = urovoFontSizeFromName(op.optString("size", "normal"));
+                        ArrayList<String> lines = wrapInternalText(text, fontSize);
+                        for (String line : lines) {
+                            int x = getInternalApproximateX(line, align, fontSize);
+                            int height = methods.drawText(line, x, y, "", fontSize, bold, false, INTERNAL_NO_ROTATE);
+                            y += Math.max(height, fontSize + INTERNAL_LINE_GAP);
+                        }
+                        y += gap;
+
+                    } else if ("qr".equals(kind)) {
+                        String value = op.optString("value", "").trim();
+                        if (value.isEmpty()) { continue; }
+                        String align = op.optString("align", "center");
+                        int size = Math.min(INTERNAL_QR_MAX_SIZE, Math.max(INTERNAL_QR_MIN_SIZE, op.optInt("size", INTERNAL_QR_DEFAULT_SIZE)));
+                        int x;
+                        if (op.has("x")) {
+                            x = Math.max(0, Math.min(op.optInt("x", 0), INTERNAL_QR_X_MAX));
+                        } else {
+                            x = getInternalAlignedX(size, align);
+                        }
+                        y += Math.max(0, op.optInt("topGap", 0));
+                        int height = methods.drawBarcode(value, x, y, INTERNAL_BARCODE_QRCODE, 5, size, INTERNAL_NO_ROTATE);
+                        y += Math.max(height, 0) + gap;
+
+                    } else if ("image".equals(kind)) {
+                        Bitmap image = decodeInternalImage(op.optString("base64", ""));
+                        if (image != null) {
+                            Bitmap trimmed = trimInternalBitmap(image);
+                            Bitmap scaled = scaleInternalBitmap(trimmed, INTERNAL_LOGO_MAX_WIDTH);
+                            String align = op.optString("align", "center");
+                            int x = getInternalAlignedX(scaled.getWidth(), align);
+                            int height = methods.drawBitmap(scaled, x, y);
+                            y += Math.max(height, scaled.getHeight()) + INTERNAL_LOGO_GAP + gap;
+                        }
+                    }
+                }
+
+                printStatus = methods.printPage(INTERNAL_NO_ROTATE);
+                if (printStatus != 0) {
+                    throw new IllegalStateException("PrinterManager.printPage returned " + printStatus);
+                }
+                methods.paperFeed(INTERNAL_BOTTOM_FEED);
+            } finally {
+                try {
+                    methods.close();
+                } catch (Exception closeError) {
+                    android.util.Log.w("ThermalPrinter", "Internal printer close failed: " + closeError.getMessage());
+                }
+            }
+
+            JSONObject result = new JSONObject();
+            result.put("status", printStatus);
+            callbackContext.success(result);
+        } catch (Exception e) {
+            final String errorMsg = e.getMessage() != null ? e.getMessage() : "Unknown internal printer error";
+            android.util.Log.e("ThermalPrinter", "Internal printer page error: " + errorMsg, e);
+            callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
+                put("error", errorMsg);
+                put("type", INTERNAL_UROVO_TYPE);
+            }}));
+        }
+    }
+
+    private int urovoFontSizeFromName(String sizeName) {
+        switch (sizeName) {
+            case "small":  return INTERNAL_FONT_SIZE_SMALL;
+            case "title":  return INTERNAL_FONT_SIZE_TITLE;
+            case "ticket": return INTERNAL_FONT_SIZE_TICKET;
+            default:       return INTERNAL_FONT_SIZE;
+        }
+    }
+
+    private int drawInternalFormattedText(InternalPrinterMethods methods, String text, int initialY) throws Exception {
+        if (text == null || text.trim().isEmpty()) {
+            return initialY;
+        }
+
+        int y = initialY;
+        String[] lines = text.split("\\r?\\n");
+        for (String rawLine : lines) {
+            String line = rawLine == null ? "" : rawLine;
+            if (line.trim().isEmpty()) {
+                y += INTERNAL_LINE_GAP;
+                continue;
+            }
+
+            Matcher qrMatcher = Pattern.compile("<qrcode[^>]*>(.*?)</qrcode>", Pattern.CASE_INSENSITIVE).matcher(line);
+            if (qrMatcher.find()) {
+                String qrData = qrMatcher.group(1).trim();
+                if (!qrData.isEmpty()) {
+                    int size = getInternalQrSize(line);
+                    String align = getInternalAlignment(line);
+                    y += getInternalQrTopGap(line);
+                    int x = getInternalQrX(line, size, align);
+                    int height = methods.drawBarcode(qrData, x, y, INTERNAL_BARCODE_QRCODE, 5, size, INTERNAL_NO_ROTATE);
+                    y += Math.max(height, 0) + getInternalQrGap(line);
+                }
+                continue;
+            }
+
+            Matcher imageMatcher = Pattern.compile("<img[^>]*>(.*?)</img>", Pattern.CASE_INSENSITIVE).matcher(line);
+            if (imageMatcher.find()) {
+                Bitmap image = decodeInternalImage(imageMatcher.group(1));
+                if (image != null) {
+                    Bitmap trimmed = trimInternalBitmap(image);
+                    Bitmap scaled = scaleInternalBitmap(trimmed, INTERNAL_LOGO_MAX_WIDTH);
+                    int x = Math.max((INTERNAL_PAGE_WIDTH - scaled.getWidth()) / 2, 0);
+                    int height = methods.drawBitmap(scaled, x, y);
+                    y += Math.max(height, scaled.getHeight()) + INTERNAL_LOGO_GAP;
+                }
+                continue;
+            }
+
+            String align = getInternalAlignment(line);
+            line = stripInternalAlignmentTag(line);
+
+            String lowerLine = line.toLowerCase();
+            boolean bold = lowerLine.contains("<b>") || lowerLine.contains("<strong>") || hasInternalEscPosBold(line);
+            int fontSize = getInternalFontSize(line);
+
+            String printable = stripInternalEscPosCommands(line)
+                .replaceAll("<[^>]*>", "")
+                .replaceAll("\\[(?![LCRlcr]\\])[^\\]]*\\]", "")
+                .replaceAll("[\\p{Cntrl}&&[^\\r\\n\\t]]", "")
+                .trim();
+
+            if (printable.isEmpty()) {
+                y += INTERNAL_LINE_GAP;
+                continue;
+            }
+
+            ArrayList<String> printableLines = wrapInternalText(printable, fontSize);
+            for (String printableLine : printableLines) {
+                int x = getInternalApproximateX(printableLine, align, fontSize);
+                int height = methods.drawText(printableLine, x, y, "", fontSize, bold, false, INTERNAL_NO_ROTATE);
+                y += Math.max(height, fontSize + INTERNAL_LINE_GAP);
+            }
+        }
+
+        return y;
+    }
+
+    private Bitmap decodeInternalImage(String imageData) {
+        if (imageData == null || imageData.trim().isEmpty()) {
+            return null;
+        }
+
+        String base64Data = imageData.trim();
+        int commaIndex = base64Data.indexOf(",");
+        if (commaIndex >= 0) {
+            base64Data = base64Data.substring(commaIndex + 1);
+        }
+
+        try {
+            byte[] decoded = Base64.decode(base64Data, Base64.DEFAULT);
+            return BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
+        } catch (Exception error) {
+            android.util.Log.w("ThermalPrinter", "Unable to decode internal printer image: " + error.getMessage());
+            return null;
+        }
+    }
+
+    private Bitmap scaleInternalBitmap(Bitmap bitmap, int maxWidth) {
+        if (bitmap.getWidth() <= maxWidth) {
+            return bitmap;
+        }
+
+        int width = maxWidth;
+        int height = Math.max((bitmap.getHeight() * width) / bitmap.getWidth(), 1);
+        return Bitmap.createScaledBitmap(bitmap, width, height, true);
+    }
+
+    private Bitmap trimInternalBitmap(Bitmap bitmap) {
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        int left = width;
+        int top = height;
+        int right = -1;
+        int bottom = -1;
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int pixel = bitmap.getPixel(x, y);
+                int alpha = (pixel >> 24) & 0xFF;
+                int red = (pixel >> 16) & 0xFF;
+                int green = (pixel >> 8) & 0xFF;
+                int blue = pixel & 0xFF;
+                if (alpha == 0) {
+                    continue;
+                }
+                if (red >= INTERNAL_WHITE_THRESHOLD && green >= INTERNAL_WHITE_THRESHOLD && blue >= INTERNAL_WHITE_THRESHOLD) {
+                    continue;
+                }
+
+                left = Math.min(left, x);
+                top = Math.min(top, y);
+                right = Math.max(right, x);
+                bottom = Math.max(bottom, y);
+            }
+        }
+
+        if (right < left || bottom < top) {
+            return bitmap;
+        }
+
+        return Bitmap.createBitmap(bitmap, left, top, (right - left) + 1, (bottom - top) + 1);
+    }
+
+    private int getInternalApproximateX(String text, String align, int fontSize) {
+        Paint paint = createInternalPaint(fontSize);
+        int textWidth = Math.min(Math.round(paint.measureText(text)), getInternalTextMaxWidth());
+        return getInternalAlignedX(textWidth, align);
+    }
+
+    private int getInternalAlignedX(int contentWidth, String align) {
+        int maxWidth = getInternalTextMaxWidth();
+        int safeWidth = Math.min(contentWidth, maxWidth);
+        if ("right".equals(align)) {
+            return Math.max(INTERNAL_PAGE_WIDTH - INTERNAL_TEXT_HORIZONTAL_PADDING - safeWidth, INTERNAL_TEXT_HORIZONTAL_PADDING);
+        }
+        if ("center".equals(align)) {
+            return Math.max((INTERNAL_PAGE_WIDTH - safeWidth) / 2, INTERNAL_TEXT_HORIZONTAL_PADDING);
+        }
+        return INTERNAL_TEXT_HORIZONTAL_PADDING;
+    }
+
+    private int getInternalTextMaxWidth() {
+        return INTERNAL_PAGE_WIDTH - (INTERNAL_TEXT_HORIZONTAL_PADDING * 2);
+    }
+
+    private Paint createInternalPaint(int fontSize) {
+        Paint paint = new Paint();
+        paint.setAntiAlias(true);
+        paint.setTextSize(fontSize);
+        return paint;
+    }
+
+    private ArrayList<String> wrapInternalText(String text, int fontSize) {
+        ArrayList<String> lines = new ArrayList<>();
+        Paint paint = createInternalPaint(fontSize);
+        int maxWidth = getInternalTextMaxWidth();
+        String[] words = text.split("\\s+");
+        StringBuilder currentLine = new StringBuilder();
+
+        for (String word : words) {
+            if (word == null || word.isEmpty()) {
+                continue;
+            }
+
+            if (paint.measureText(word) > maxWidth) {
+                if (currentLine.length() > 0) {
+                    lines.add(currentLine.toString());
+                    currentLine.setLength(0);
+                }
+                splitInternalLongWord(lines, word, paint, maxWidth);
+                continue;
+            }
+
+            String candidate = currentLine.length() == 0 ? word : currentLine + " " + word;
+            if (paint.measureText(candidate) <= maxWidth) {
+                currentLine.setLength(0);
+                currentLine.append(candidate);
+            } else {
+                lines.add(currentLine.toString());
+                currentLine.setLength(0);
+                currentLine.append(word);
+            }
+        }
+
+        if (currentLine.length() > 0) {
+            lines.add(currentLine.toString());
+        }
+
+        if (lines.isEmpty() && text != null && !text.isEmpty()) {
+            lines.add(text);
+        }
+
+        return lines;
+    }
+
+    private void splitInternalLongWord(ArrayList<String> lines, String word, Paint paint, int maxWidth) {
+        StringBuilder currentPart = new StringBuilder();
+        for (int i = 0; i < word.length(); i++) {
+            String candidate = currentPart.toString() + word.charAt(i);
+            if (currentPart.length() > 0 && paint.measureText(candidate) > maxWidth) {
+                lines.add(currentPart.toString());
+                currentPart.setLength(0);
+            }
+            currentPart.append(word.charAt(i));
+        }
+        if (currentPart.length() > 0) {
+            lines.add(currentPart.toString());
+        }
+    }
+
+    private int getInternalQrX(String line, int size, String align) {
+        Matcher xMatcher = Pattern.compile("<qrcode[^>]*x=(?:\'|\")?(\\d+)(?:\'|\")?[^>]*>", Pattern.CASE_INSENSITIVE).matcher(line);
+        if (xMatcher.find()) {
+            try {
+                int requestedX = Integer.parseInt(xMatcher.group(1));
+                return Math.max(0, Math.min(requestedX, INTERNAL_QR_X_MAX));
+            } catch (Exception ignored) {
+                return getInternalAlignedX(size, align);
+            }
+        }
+
+        return getInternalAlignedX(size, align);
+    }
+
+    private int getInternalQrGap(String line) {
+        Matcher gapMatcher = Pattern.compile("<qrcode[^>]*gap=(?:\'|\")?(\\d+)(?:\'|\")?[^>]*>", Pattern.CASE_INSENSITIVE).matcher(line);
+        if (gapMatcher.find()) {
+            try {
+                return Math.max(0, Integer.parseInt(gapMatcher.group(1)));
+            } catch (Exception ignored) {
+                return INTERNAL_LINE_GAP;
+            }
+        }
+
+        return INTERNAL_LINE_GAP;
+    }
+
+    private int getInternalQrTopGap(String line) {
+        Matcher topGapMatcher = Pattern.compile("<qrcode[^>]*topgap=(?:\'|\")?(\\d+)(?:\'|\")?[^>]*>", Pattern.CASE_INSENSITIVE).matcher(line);
+        if (topGapMatcher.find()) {
+            try {
+                return Math.max(0, Integer.parseInt(topGapMatcher.group(1)));
+            } catch (Exception ignored) {
+                return 0;
+            }
+        }
+
+        return 0;
+    }
+
+    private int getInternalQrSize(String line) {
+        Matcher sizeMatcher = Pattern.compile("<qrcode[^>]*size=(?:\'|\\\")?(\\d+)(?:\'|\\\")?[^>]*>", Pattern.CASE_INSENSITIVE).matcher(line);
+        if (sizeMatcher.find()) {
+            try {
+                int requestedSize = Integer.parseInt(sizeMatcher.group(1));
+                return Math.max(INTERNAL_QR_MIN_SIZE, Math.min(requestedSize * 11, INTERNAL_QR_MAX_SIZE));
+            } catch (Exception ignored) {
+                return INTERNAL_QR_DEFAULT_SIZE;
+            }
+        }
+        return INTERNAL_QR_DEFAULT_SIZE;
+    }
+
+    private String getInternalAlignment(String line) {
+        String align = "left";
+        Matcher alignMatcher = Pattern.compile("^\\s*\\[(L|C|R)\\]", Pattern.CASE_INSENSITIVE).matcher(line);
+        if (alignMatcher.find()) {
+            String tag = alignMatcher.group(1).toUpperCase();
+            align = "C".equals(tag) ? "center" : "R".equals(tag) ? "right" : "left";
+        }
+
+        for (int i = 0; i + 2 < line.length(); i++) {
+            if (line.charAt(i) == 0x1B && line.charAt(i + 1) == 'a') {
+                char value = line.charAt(i + 2);
+                if (value == 0x01 || value == '1') {
+                    align = "center";
+                } else if (value == 0x02 || value == '2') {
+                    align = "right";
+                } else if (value == 0x00 || value == '0') {
+                    align = "left";
+                }
+            }
+        }
+
+        return align;
+    }
+
+    private String stripInternalAlignmentTag(String line) {
+        Matcher alignMatcher = Pattern.compile("^\\s*\\[(L|C|R)\\]", Pattern.CASE_INSENSITIVE).matcher(line);
+        if (alignMatcher.find()) {
+            return line.substring(alignMatcher.end());
+        }
+        return line;
+    }
+
+    private boolean hasInternalEscPosBold(String line) {
+        for (int i = 0; i + 2 < line.length(); i++) {
+            if (line.charAt(i) == 0x1B && line.charAt(i + 1) == 'E') {
+                char value = line.charAt(i + 2);
+                if (value == 0x01 || value == '1') {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private int getInternalFontSize(String line) {
+        String lowerLine = line.toLowerCase();
+        if (lowerLine.contains("size='tall'") || lowerLine.contains("size=\"tall\"")) {
+            return INTERNAL_FONT_SIZE_TICKET;
+        }
+        if (lowerLine.contains("size='wide'") || lowerLine.contains("size=\"wide\"")) {
+            return INTERNAL_FONT_SIZE_TITLE;
+        }
+        if (lowerLine.contains("size='small'") || lowerLine.contains("size=\"small\"")) {
+            return INTERNAL_FONT_SIZE_SMALL;
+        }
+
+        int fontSize = INTERNAL_FONT_SIZE;
+        for (int i = 0; i + 2 < line.length(); i++) {
+            if (line.charAt(i) == 0x1D && line.charAt(i + 1) == '!') {
+                int value = line.charAt(i + 2);
+                if (value >= 0x55) {
+                    fontSize = Math.max(fontSize, INTERNAL_FONT_SIZE_TICKET);
+                } else if ((value & 0x11) == 0x11 || value >= 0x11) {
+                    fontSize = Math.max(fontSize, INTERNAL_FONT_SIZE_TITLE);
+                }
+            }
+        }
+        return fontSize;
+    }
+
+    private String stripInternalEscPosCommands(String line) {
+        StringBuilder printable = new StringBuilder();
+        for (int i = 0; i < line.length(); i++) {
+            char current = line.charAt(i);
+            if (current == 0x1B && i + 2 < line.length()) {
+                char command = line.charAt(i + 1);
+                if (command == 'a' || command == 'E') {
+                    i += 2;
+                    continue;
+                }
+            }
+            if (current == 0x1D && i + 2 < line.length() && line.charAt(i + 1) == '!') {
+                i += 2;
+                continue;
+            }
+            printable.append(current);
+        }
+        return printable.toString();
+    }
+
+    private static class InternalPrinterMethods {
+        private final Object printerManager;
+        private final Method open;
+        private final Method close;
+        private final Method setupPage;
+        private final Method clearPage;
+        private final Method drawText;
+        private final Method drawBitmap;
+        private final Method drawBarcode;
+        private final Method paperFeed;
+        private final Method printPage;
+
+        InternalPrinterMethods(Object printerManager) throws NoSuchMethodException {
+            this.printerManager = printerManager;
+            Class<?> managerClass = printerManager.getClass();
+            open = managerClass.getMethod("open");
+            close = managerClass.getMethod("close");
+            setupPage = managerClass.getMethod("setupPage", int.class, int.class);
+            clearPage = managerClass.getMethod("clearPage");
+            drawText = managerClass.getMethod(
+                "drawText",
+                String.class,
+                int.class,
+                int.class,
+                String.class,
+                int.class,
+                boolean.class,
+                boolean.class,
+                int.class
+            );
+            drawBitmap = managerClass.getMethod("drawBitmap", Bitmap.class, int.class, int.class);
+            drawBarcode = managerClass.getMethod(
+                "drawBarcode",
+                String.class,
+                int.class,
+                int.class,
+                int.class,
+                int.class,
+                int.class,
+                int.class
+            );
+            paperFeed = managerClass.getMethod("paperFeed", int.class);
+            printPage = managerClass.getMethod("printPage", int.class);
+        }
+
+        int open() throws Exception {
+            return (Integer) open.invoke(printerManager);
+        }
+
+        void close() throws Exception {
+            close.invoke(printerManager);
+        }
+
+        void setupPage(int width, int height) throws Exception {
+            setupPage.invoke(printerManager, width, height);
+        }
+
+        void clearPage() throws Exception {
+            clearPage.invoke(printerManager);
+        }
+
+        int drawText(String text, int x, int y, String font, int size, boolean bold, boolean italic, int rotate) throws Exception {
+            return (Integer) drawText.invoke(printerManager, text, x, y, font, size, bold, italic, rotate);
+        }
+
+        int drawBitmap(Bitmap bitmap, int x, int y) throws Exception {
+            return (Integer) drawBitmap.invoke(printerManager, bitmap, x, y);
+        }
+
+        int drawBarcode(String data, int x, int y, int type, int width, int height, int rotate) throws Exception {
+            return (Integer) drawBarcode.invoke(printerManager, data, x, y, type, width, height, rotate);
+        }
+
+        void paperFeed(int level) throws Exception {
+            paperFeed.invoke(printerManager, level);
+        }
+
+        int printPage(int rotate) throws Exception {
+            return (Integer) printPage.invoke(printerManager, rotate);
+        }
     }
 
     private EscPosPrinter getPrinter(CallbackContext callbackContext, JSONObject data) throws JSONException {

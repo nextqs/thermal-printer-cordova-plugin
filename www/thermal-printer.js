@@ -5,11 +5,11 @@ module.exports = {
    * List available printers
    *
    * @param {Object} data - Data object
-   * @param {"bluetooth"|"usb"} data.type - Type of list: bluetooth or usb
+   * @param {"bluetooth"|"usb"|"internal-urovo"} data.type - Type of list: bluetooth, usb or internal-urovo
    * @param {function} successCallback - Result on success
    * @param {function} errorCallback - Result on failure
    */
-  listPrinters: function(data, successCallback, errorCallback) {
+  listPrinters: function (data, successCallback, errorCallback) {
     cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'listPrinters', [data]);
   },
 
@@ -28,7 +28,7 @@ module.exports = {
    * @param {function} successCallback - Result on success
    * @param {function} errorCallback - Result on failure
    */
-  printFormattedText: function(data, successCallback, errorCallback) {
+  printFormattedText: function (data, successCallback, errorCallback) {
     cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'printFormattedText', [data]);
   },
 
@@ -47,7 +47,7 @@ module.exports = {
    * @param {function} successCallback - Result on success
    * @param {function} errorCallback - Result on failure
    */
-  printFormattedTextAndCut: function(data, successCallback, errorCallback) {
+  printFormattedTextAndCut: function (data, successCallback, errorCallback) {
     cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'printFormattedTextAndCut', [data]);
   },
 
@@ -62,7 +62,7 @@ module.exports = {
    * @param {function} successCallback - Result on success
    * @param {function} errorCallback - Result on failure
    */
-  getEncoding: function(data, successCallback, errorCallback) {
+  getEncoding: function (data, successCallback, errorCallback) {
     cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'getEncoding', [data]);
   },
 
@@ -77,7 +77,7 @@ module.exports = {
    * @param {function} successCallback - Result on success
    * @param {function} errorCallback - Result on failure
    */
-  disconnectPrinter: function(data, successCallback, errorCallback) {
+  disconnectPrinter: function (data, successCallback, errorCallback) {
     cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'disconnectPrinter', [data]);
   },
 
@@ -92,7 +92,7 @@ module.exports = {
    * @param {function} successCallback - Result on success
    * @param {function} errorCallback - Result on failure
    */
-  requestPermissions: function(data, successCallback, errorCallback) {
+  requestPermissions: function (data, successCallback, errorCallback) {
     cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'requestPermissions', [data]);
   },
 
@@ -108,7 +108,22 @@ module.exports = {
    * @param {function} successCallback - Result on success
    * @param {function} errorCallback - Result on failure
    */
-  bitmapToHexadecimalString: function(data, successCallback, errorCallback) {
+  bitmapToHexadecimalString: function (data, successCallback, errorCallback) {
     cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'bitmapToHexadecimalString', [data]);
+  },
+
+  /**
+   * Print a page on the Urovo/Gertec internal printer using structured operations.
+   * Layout coordinates are resolved by the plugin; caller specifies only content and style.
+   *
+   * @param {Object} data - Page descriptor
+   * @param {'internal-urovo'} data.type - Must be 'internal-urovo'
+   * @param {'internal-urovo'} data.id - Must be 'internal-urovo'
+   * @param {Array} data.operations - Ordered array of UrovoOperation objects
+   * @param {function} successCallback - Result on success
+   * @param {function} errorCallback - Result on failure
+   */
+  printInternalUrovoPage: function (data, successCallback, errorCallback) {
+    cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'printInternalUrovoPage', [data]);
   },
 };

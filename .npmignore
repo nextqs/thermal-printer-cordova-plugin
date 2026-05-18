@@ -1,0 +1,17 @@
+/.idea
+/node_modules
+/dist
+.gradle
+**/.gradle
+src/android/.gradle/**
+*.spec.ts
+tests/
+e2e/
+.git
+.gitignore
+.editorconfig
+.prettierrc
+tslint.json
+tsconfig.json
+tsconfig.spec.json
+karma.conf.js

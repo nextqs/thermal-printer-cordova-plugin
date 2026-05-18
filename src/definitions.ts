@@ -12,10 +12,17 @@ export interface Printer {
     deviceId?: number;
     serialNumber?: string;
     vendorId?: number;
+
+    // Internal Android printer (Gertec GPOS820 / Urovo-compatible runtime)
+    id?: string;
+    manufacturer?: string;
+    brand?: string;
+    model?: string;
+    device?: string;
 }
 
 export interface PrinterToUse {
-    type: 'bluetooth' | 'tcp' | 'usb';
+    type: 'bluetooth' | 'tcp' | 'usb' | 'internal-urovo';
     id: string | number;
     address?: string;
     port?: number;
@@ -39,6 +46,62 @@ export interface BitmapToHexadecimalString extends PrinterToUse {
     base64: string;
 }
 
+// ─── Urovo internal printer structured operations ───────────────────────────
+
+export type UrovoTextSize = 'small' | 'normal' | 'title' | 'ticket';
+export type UrovoAlign = 'left' | 'center' | 'right';
+
+export interface UrovoTextOperation {
+    kind: 'text';
+    text: string;
+    align: UrovoAlign;
+    size: UrovoTextSize;
+    bold?: boolean;
+    /** Extra vertical gap in dots after this element */
+    gap?: number;
+}
+
+export interface UrovoQrOperation {
+    kind: 'qr';
+    value: string;
+    align: UrovoAlign;
+    /** QR module size in dots (240–320, default 280) */
+    size?: number;
+    /** Optional absolute X position in dots for devices that need precise QR centering */
+    x?: number;
+    /** Optional vertical space in dots before drawing the QR */
+    topGap?: number;
+    /** Extra vertical gap in dots after this element */
+    gap?: number;
+}
+
+export interface UrovoImageOperation {
+    kind: 'image';
+    /** Base64-encoded image (PNG/JPEG, with or without data URI prefix) */
+    base64: string;
+    align: UrovoAlign;
+    /** Extra vertical gap in dots after this element */
+    gap?: number;
+}
+
+export interface UrovoGapOperation {
+    kind: 'gap';
+    /** Vertical space in dots */
+    dots: number;
+}
+
+export type UrovoOperation =
+    | UrovoTextOperation
+    | UrovoQrOperation
+    | UrovoImageOperation
+    | UrovoGapOperation;
+
+export interface PrintInternalUrovoPage {
+    type: 'internal-urovo';
+    id: 'internal-urovo';
+    operations: UrovoOperation[];
+}
+
 export interface RequestPermissionsResult {
     granted: boolean;
 }
@@ -57,11 +120,11 @@ export interface ThermalPrinterPlugin {
    * List available printers
    *
    * @param {Object} data - Data object
-   * @param {"bluetooth"|"usb"} data.type - Type of list: bluetooth or usb
+   * @param {"bluetooth"|"usb"|"internal-urovo"} data.type - Type of list: bluetooth, usb or internal-urovo
    * @param {function} success
    * @param {function} error
    */
-  listPrinters(data: { type: 'bluetooth' | 'usb'; }, success: (value: Printer[]) => any, error: (value: ErrorResult) => void);
+  listPrinters(data: { type: 'bluetooth' | 'usb' | 'internal-urovo'; }, success: (value: Printer[]) => any, error: (value: ErrorResult) => void);
 
   /**
    * Print a formatted text and feed paper
@@ -149,4 +212,14 @@ export interface ThermalPrinterPlugin {
    * @param {function} error
    */
   bitmapToHexadecimalString(data: BitmapToHexadecimalString, success: (value: string) => any, error: (value: ErrorResult) => void);
+
+  /**
+   * Print a page on the Urovo/Gertec internal printer using structured operations.
+   * The plugin resolves layout coordinates; the caller only specifies content and style.
+   *
+   * @param {PrintInternalUrovoPage} data - Page descriptor with ordered operations array
+   * @param {function} success
+   * @param {function} error
+   */
+  printInternalUrovoPage(data: PrintInternalUrovoPage, success: () => void, error: (value: ErrorResult) => void);
 }
