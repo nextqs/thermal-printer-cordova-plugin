@@ -14,6 +14,26 @@ module.exports = {
   },
 
   /**
+   * USB/power diagnostics: UsbManager devices, connection cache, USB_STATE, battery and recent events
+   *
+   * @param {function} successCallback - Result on success
+   * @param {function} errorCallback - Result on failure
+   */
+  getUsbDiagnostics: function (successCallback, errorCallback) {
+    cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'getUsbDiagnostics', []);
+  },
+
+  /**
+   * Stream USB attach/detach, USB_STATE, power and screen events (callback is kept and called for every event)
+   *
+   * @param {function} eventCallback - Called with each event
+   * @param {function} errorCallback - Result on failure
+   */
+  onUsbEvent: function (eventCallback, errorCallback) {
+    cordova.exec(eventCallback, errorCallback, 'ThermalPrinter', 'registerUsbEventListener', []);
+  },
+
+  /**
    * Print a formatted text and feed paper
    * @see https://github.com/DantSu/ESCPOS-ThermalPrinter-Android#formatted-text--syntax-guide
    *

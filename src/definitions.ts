@@ -115,6 +115,90 @@ export interface ErrorResult {
     error?: string;
 }
 
+/**
+ * Available since v1.2.0 — shapes returned by getUsbDiagnostics() and onUsbEvent().
+ */
+
+export interface UsbEndpointInfo {
+    address: number;
+    /** UsbConstants.USB_ENDPOINT_XFER_* */
+    type: number;
+    direction: 'in' | 'out';
+    maxPacketSize: number;
+}
+
+export interface UsbInterfaceInfo {
+    id: number;
+    class: number;
+    subclass: number;
+    protocol: number;
+    endpoints: UsbEndpointInfo[];
+}
+
+export interface UsbDeviceInfo {
+    deviceName: string;
+    /** Changes every time the device re-enumerates on the bus */
+    deviceId: number;
+    vendorId: number;
+    productId: number;
+    deviceClass: number;
+    interfaceCount: number;
+    interfaces: UsbInterfaceInfo[];
+    productName?: string;
+    manufacturerName?: string;
+    /** Only reported by getUsbDiagnostics(), not by the event stream */
+    hasPermission?: boolean;
+    /** Only reported by getUsbDiagnostics(), and only when readable */
+    serialNumber?: string;
+}
+
+export interface UsbPowerState {
+    /** BatteryManager.EXTRA_PLUGGED: 0 when unplugged, -1 when unknown */
+    plugged?: number;
+    pluggedLabel?: 'ac' | 'usb' | 'wireless' | 'unplugged' | 'other';
+    /** BatteryManager.EXTRA_STATUS */
+    status?: number;
+    levelPercent?: number;
+    voltageMv?: number;
+}
+
+export interface UsbEvent {
+    timestamp?: number;
+    uptimeMs?: number;
+    /** e.g. android.hardware.usb.action.USB_DEVICE_ATTACHED, android.intent.action.POWER_CONNECTED */
+    action?: string;
+    /** Present on attach/detach only */
+    device?: UsbDeviceInfo;
+    /** Sticky USB_STATE extras, stringified. Present on USB_STATE only */
+    extras?: { [key: string]: string | null };
+    power?: UsbPowerState;
+    /** Number of devices reported by UsbManager, or -1 when unavailable */
+    usbDeviceCount?: number;
+}
+
+export interface UsbConnectionCacheEntry {
+    key: string;
+    isConnected: boolean;
+    deviceName?: string;
+    deviceId?: number;
+}
+
+export interface UsbDiagnostics {
+    timestamp?: number;
+    uptimeMs?: number;
+    /** Manufacturer, model, SDK level and build */
+    device?: string;
+    /** False when the USB/power receiver failed to register: the connection cache is then only cleared on detach and on print failure */
+    receiverRegistered?: boolean;
+    eventListenerAttached?: boolean;
+    verboseLogging?: boolean;
+    power?: UsbPowerState;
+    usbState?: { [key: string]: string | null };
+    usbDevices?: UsbDeviceInfo[];
+    connectionCache?: UsbConnectionCacheEntry[];
+    recentEvents?: UsbEvent[];
+}
+
 export interface ThermalPrinterPlugin {
   /**
    * List available printers
@@ -185,6 +269,28 @@ export interface ThermalPrinterPlugin {
    * @param {function} error
    */
   disconnectPrinter(data: PrinterToUse, success: () => void, error: (value: ErrorResult) => void);
+
+  /**
+   * USB/power diagnostics: UsbManager devices, connection cache, USB_STATE, battery and recent events
+   *
+   * Available since v1.2.0. Optional so that code written against 1.1.0 keeps type-checking; guard with
+   * `typeof ThermalPrinter.getUsbDiagnostics === 'function'` when the plugin version is not pinned.
+   *
+   * @param {function} success
+   * @param {function} error
+   */
+  getUsbDiagnostics?(success: (value: UsbDiagnostics) => void, error: (value: ErrorResult) => void): void;
+
+  /**
+   * Stream USB attach/detach, USB_STATE, power and screen events. The success callback is called for every event.
+   *
+   * Available since v1.2.0. Optional for the same reason as getUsbDiagnostics. Calling it again replaces the
+   * previous subscription, so subscribe once.
+   *
+   * @param {function} success
+   * @param {function} error
+   */
+  onUsbEvent?(success: (event: UsbEvent) => void, error: (value: ErrorResult) => void): void;
 
   /**
    * Request permissions for USB printers

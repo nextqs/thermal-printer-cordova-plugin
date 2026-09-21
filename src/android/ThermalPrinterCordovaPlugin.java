@@ -13,9 +13,14 @@ import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Paint;
+import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
+import android.os.BatteryManager;
 import android.os.Build;
+import android.os.SystemClock;
 import android.util.Base64;
 
 import com.dantsu.escposprinter.EscPosCharsetEncoding;
@@ -34,14 +39,20 @@ import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaInterface;
 import org.apache.cordova.CordovaPlugin;
 import org.apache.cordova.CordovaWebView;
+import org.apache.cordova.PluginResult;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -71,17 +82,51 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     private final HashMap<String, DeviceConnection> connections = new HashMap<>();
     private BroadcastReceiver usbDetachReceiver;
     private boolean isUsbReceiverRegistered = false;
-    
+
+    // USB/power diagnostics (OTG investigation): last events kept in memory and optionally streamed to JS
+    private static final String USB_DIAG_TAG = "ThermalPrinterUsbDiag";
+    private static final String ACTION_USB_STATE = "android.hardware.usb.action.USB_STATE";
+    private static final int USB_EVENT_HISTORY_SIZE = 200;
+    /**
+     * Per-print lifecycle lines and the full JSON dump of every event. Off for production: a kiosk prints
+     * continuously, and getUsbDiagnostics() is the on-demand field tool. Flip to true to reproduce the
+     * volume used during the OTG investigation. Attach/detach/power events are always logged, compactly.
+     */
+    private static final boolean USB_DIAG_VERBOSE = false;
+    private final ArrayDeque<JSONObject> usbEventHistory = new ArrayDeque<>();
+    private BroadcastReceiver usbDiagnosticsReceiver;
+    private volatile boolean isUsbDiagnosticsReceiverRegistered = false;
+    // Written by the Cordova thread pool, read by the event dispatcher: volatile for visibility
+    private volatile CallbackContext usbEventListener;
+    // Single thread: keeps event order while getting the binder calls and JSON off the main thread
+    private volatile ExecutorService usbEventExecutor;
+    private final AtomicLong printJobSequence = new AtomicLong();
+
     @Override
     public void initialize(CordovaInterface cordova, CordovaWebView webView) {
         super.initialize(cordova, webView);
+        usbEventExecutor = Executors.newSingleThreadExecutor();
         registerUsbDetachReceiver();
+        registerUsbDiagnosticsReceiver();
     }
-    
+
     @Override
     public void onDestroy() {
         super.onDestroy();
         unregisterUsbDetachReceiver();
+        unregisterUsbDiagnosticsReceiver();
+        releaseUsbEventListener();
+        if (usbEventExecutor != null) {
+            usbEventExecutor.shutdown();
+            usbEventExecutor = null;
+        }
+    }
+
+    @Override
+    public void onReset() {
+        super.onReset();
+        // The webview reloaded: the kept callback belongs to a page that no longer exists
+        releaseUsbEventListener();
     }
     
     private void registerUsbDetachReceiver() {
@@ -135,30 +180,429 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     
     private void handleUsbDeviceDetached(UsbDevice device) {
         android.util.Log.i("ThermalPrinter", "USB device detached: vendorId=" + device.getVendorId() + ", productId=" + device.getProductId());
-        
-        // Clear ALL cached USB connections (deviceId changes after reconnect)
+        clearUsbConnections("device detached");
+    }
+
+    /**
+     * Drops every cached USB connection. Called on detach and after a failed USB print, where the cached
+     * connection is either gone or already proven unusable.
+     */
+    private void clearUsbConnections(String reason) {
+        removeUsbConnections(listCachedUsbKeys(), null, reason);
+    }
+
+    /**
+     * Drops only the cached USB connections whose device left the bus or came back re-enumerated with a new
+     * deviceId (the file descriptor dies with the old enumeration). Connections to devices that are still
+     * present on the same enumeration are kept, so attaching an unrelated device on a hub does not tear
+     * down a print in flight. Called on USB_DEVICE_ATTACHED.
+     */
+    private void clearStaleUsbConnections(String reason) {
+        ArrayList<String> staleKeys = new ArrayList<>();
+        HashMap<String, DeviceConnection> staleConnections = new HashMap<>();
+
+        for (String key : listCachedUsbKeys()) {
+            DeviceConnection connection;
+            synchronized (connections) {
+                connection = connections.get(key);
+            }
+            if (connection == null) {
+                continue;
+            }
+            // Validated outside the lock: isUsbDeviceStillPresent() does binder calls into UsbManager
+            if (connection instanceof UsbConnection
+                && isUsbDeviceStillPresent(((UsbConnection) connection).getDevice())) {
+                continue;
+            }
+            staleKeys.add(key);
+            staleConnections.put(key, connection);
+        }
+
+        // Pass what was judged stale: another thread may have replaced the entry while we validated
+        removeUsbConnections(staleKeys, staleConnections, reason);
+    }
+
+    private ArrayList<String> listCachedUsbKeys() {
+        ArrayList<String> keys = new ArrayList<>();
         // Thread-safe: synchronize access to connections HashMap
         synchronized (connections) {
-            ArrayList<String> keysToRemove = new ArrayList<>();
-            
             for (String key : connections.keySet()) {
                 if (key.startsWith("usb-")) {
-                    keysToRemove.add(key);
+                    keys.add(key);
                 }
             }
-            
-            for (String key : keysToRemove) {
-                DeviceConnection connection = connections.get(key);
-                if (connection != null) {
-                    try {
-                        connection.disconnect();
-                        android.util.Log.i("ThermalPrinter", "Disconnected and removed cached USB connection: " + key);
-                    } catch (Exception e) {
-                        android.util.Log.e("ThermalPrinter", "Error disconnecting: " + e.getMessage());
+        }
+        return keys;
+    }
+
+    /**
+     * Removes each key from the cache before disconnecting it, so no other thread can pick the connection
+     * up from the cache while it is being torn down.
+     *
+     * @param expected when given, a key whose cached connection is no longer the one mapped here was
+     *                 replaced by another thread after it was selected, and is left alone: a stale-connection
+     *                 sweep must never tear down a connection that was opened while it was running. Pass
+     *                 null to remove whatever is cached under each key.
+     */
+    private void removeUsbConnections(ArrayList<String> keys, HashMap<String, DeviceConnection> expected, String reason) {
+        if (keys.isEmpty()) {
+            return;
+        }
+
+        int removed = 0;
+        for (String key : keys) {
+            DeviceConnection connection;
+            synchronized (connections) {
+                if (expected != null && connections.get(key) != expected.get(key)) {
+                    android.util.Log.i("ThermalPrinter", "Cached USB connection replaced while validating, keeping it: " + key);
+                    continue;
+                }
+                connection = connections.remove(key);
+            }
+            if (connection != null) {
+                removed++;
+                try {
+                    connection.disconnect();
+                    android.util.Log.i("ThermalPrinter", "Disconnected and removed cached USB connection: " + key + " (" + reason + ")");
+                } catch (Exception e) {
+                    android.util.Log.e("ThermalPrinter", "Error disconnecting: " + e.getMessage());
+                }
+            }
+        }
+
+        if (removed > 0) {
+            android.util.Log.i("ThermalPrinter", "Cleared " + removed + " cached USB connection(s): " + reason);
+        }
+    }
+
+    private void registerUsbDiagnosticsReceiver() {
+        if (usbDiagnosticsReceiver != null) {
+            return;
+        }
+
+        usbDiagnosticsReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                // Read everything we need from the Intent while we are still inside onReceive, then hand
+                // plain data over: the binder calls, the JSON and the log must not run on the main thread.
+                final String action = intent.getAction();
+                final UsbDevice device = extractUsbDevice(intent, action);
+                final JSONObject extras = ACTION_USB_STATE.equals(action) ? extractExtras(intent) : null;
+                dispatchUsbEvent(action, device, extras);
+            }
+        };
+
+        try {
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+            filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+            filter.addAction(Intent.ACTION_POWER_CONNECTED);
+            filter.addAction(Intent.ACTION_POWER_DISCONNECTED);
+            filter.addAction(ACTION_USB_STATE);
+            filter.addAction(Intent.ACTION_SCREEN_ON);
+            filter.addAction(Intent.ACTION_SCREEN_OFF);
+
+            // Application context so the receiver does not hold on to the Activity. It is still unregistered
+            // in onDestroy() and registered again from initialize(), so it does not outlive the plugin.
+            Context appContext = cordova.getActivity().getApplicationContext();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                appContext.registerReceiver(usbDiagnosticsReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                appContext.registerReceiver(usbDiagnosticsReceiver, filter);
+            }
+            isUsbDiagnosticsReceiverRegistered = true;
+            android.util.Log.i(USB_DIAG_TAG, "USB diagnostics receiver registered");
+        } catch (Exception e) {
+            usbDiagnosticsReceiver = null;
+            isUsbDiagnosticsReceiverRegistered = false;
+            // Without this receiver the cache is only cleared on detach and on print failure, so surface the
+            // state in getUsbDiagnostics() instead of failing silently.
+            android.util.Log.e(USB_DIAG_TAG, "Failed to register USB diagnostics receiver: " + e.getMessage());
+        }
+    }
+
+    private void unregisterUsbDiagnosticsReceiver() {
+        if (usbDiagnosticsReceiver == null) {
+            return;
+        }
+        try {
+            cordova.getActivity().getApplicationContext().unregisterReceiver(usbDiagnosticsReceiver);
+        } catch (Exception e) {
+            android.util.Log.e(USB_DIAG_TAG, "Failed to unregister USB diagnostics receiver: " + e.getMessage());
+        }
+        usbDiagnosticsReceiver = null;
+        isUsbDiagnosticsReceiverRegistered = false;
+    }
+
+    private UsbDevice extractUsbDevice(Intent intent, String action) {
+        if (!UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action) && !UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
+            return null;
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
+            }
+            return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+        } catch (Exception e) {
+            android.util.Log.e(USB_DIAG_TAG, "Failed to read USB device from intent: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private JSONObject extractExtras(Intent intent) {
+        try {
+            if (intent.getExtras() == null) {
+                return null;
+            }
+            JSONObject extras = new JSONObject();
+            for (String key : intent.getExtras().keySet()) {
+                Object value = intent.getExtras().get(key);
+                extras.put(key, value == null ? JSONObject.NULL : String.valueOf(value));
+            }
+            return extras;
+        } catch (Exception e) {
+            android.util.Log.e(USB_DIAG_TAG, "Failed to read intent extras: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private void dispatchUsbEvent(final String action, final UsbDevice device, final JSONObject extras) {
+        Runnable task = () -> {
+            if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
+                // Before notifying JS: a print started in reaction to this event must never find a cached
+                // connection whose device came back re-enumerated.
+                clearStaleUsbConnections("device attached");
+            }
+            recordUsbEvent(action, device, extras);
+        };
+
+        ExecutorService executor = usbEventExecutor;
+        if (executor == null || executor.isShutdown()) {
+            task.run();
+            return;
+        }
+        try {
+            executor.execute(task);
+        } catch (RejectedExecutionException e) {
+            task.run();
+        }
+    }
+
+    private void recordUsbEvent(String action, UsbDevice device, JSONObject extras) {
+        JSONObject event = new JSONObject();
+        JSONObject power = null;
+        int usbDeviceCount = -1;
+        try {
+            event.put("timestamp", System.currentTimeMillis());
+            event.put("uptimeMs", SystemClock.elapsedRealtime());
+            event.put("action", action);
+
+            if (device != null) {
+                event.put("device", describeUsbDevice(device, null));
+            }
+            if (extras != null) {
+                event.put("extras", extras);
+            }
+
+            power = readPowerState();
+            usbDeviceCount = countUsbDevices();
+            event.put("power", power);
+            event.put("usbDeviceCount", usbDeviceCount);
+        } catch (Exception e) {
+            android.util.Log.e(USB_DIAG_TAG, "Failed to build USB event: " + e.getMessage());
+        }
+
+        // One compact line per event: this is the trace the field procedure looks for. The full payload is
+        // available on demand through getUsbDiagnostics(), which also returns the last events.
+        android.util.Log.i(USB_DIAG_TAG, "[event] " + action
+            + " usbDeviceCount=" + usbDeviceCount
+            + " plugged=" + (power == null ? "?" : power.optString("pluggedLabel", "?"))
+            + " level=" + (power == null ? -1 : power.optInt("levelPercent", -1)) + "%");
+        if (USB_DIAG_VERBOSE) {
+            android.util.Log.i(USB_DIAG_TAG, "[event][full] " + event);
+        }
+
+        synchronized (usbEventHistory) {
+            usbEventHistory.addLast(event);
+            while (usbEventHistory.size() > USB_EVENT_HISTORY_SIZE) {
+                usbEventHistory.removeFirst();
+            }
+        }
+
+        CallbackContext listener = usbEventListener;
+        if (listener != null) {
+            try {
+                PluginResult result = new PluginResult(PluginResult.Status.OK, event);
+                result.setKeepCallback(true);
+                listener.sendPluginResult(result);
+            } catch (Exception e) {
+                android.util.Log.e(USB_DIAG_TAG, "Failed to deliver USB event: " + e.getMessage());
+            }
+        }
+    }
+
+    private void registerUsbEventListener(CallbackContext callbackContext) {
+        CallbackContext previous = usbEventListener;
+        usbEventListener = callbackContext;
+        // Release the previous subscription instead of leaving its kept callback dangling in the bridge
+        if (previous != null && previous != callbackContext) {
+            finishUsbEventListener(previous);
+        }
+
+        PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT);
+        result.setKeepCallback(true);
+        callbackContext.sendPluginResult(result);
+    }
+
+    private void releaseUsbEventListener() {
+        CallbackContext listener = usbEventListener;
+        usbEventListener = null;
+        finishUsbEventListener(listener);
+    }
+
+    private void finishUsbEventListener(CallbackContext listener) {
+        if (listener == null) {
+            return;
+        }
+        try {
+            PluginResult done = new PluginResult(PluginResult.Status.NO_RESULT);
+            done.setKeepCallback(false);
+            listener.sendPluginResult(done);
+        } catch (Exception ignored) {}
+    }
+
+    private int countUsbDevices() {
+        try {
+            UsbManager usbManager = (UsbManager) cordova.getActivity().getSystemService(Context.USB_SERVICE);
+            return usbManager == null ? -1 : usbManager.getDeviceList().size();
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private JSONObject readPowerState() throws JSONException {
+        JSONObject power = new JSONObject();
+        Intent battery = cordova.getActivity().getApplicationContext()
+            .registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (battery != null) {
+            int plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1);
+            power.put("plugged", plugged);
+            power.put("pluggedLabel", plugged == BatteryManager.BATTERY_PLUGGED_AC ? "ac"
+                : plugged == BatteryManager.BATTERY_PLUGGED_USB ? "usb"
+                : plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS ? "wireless"
+                : plugged == 0 ? "unplugged" : "other");
+            power.put("status", battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1));
+            int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+            int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+            power.put("levelPercent", level >= 0 && scale > 0 ? (level * 100) / scale : -1);
+            power.put("voltageMv", battery.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1));
+        }
+        return power;
+    }
+
+    private JSONObject describeUsbDevice(UsbDevice device, UsbManager usbManager) throws JSONException {
+        JSONObject obj = new JSONObject();
+        obj.put("deviceName", device.getDeviceName());
+        obj.put("deviceId", device.getDeviceId());
+        obj.put("vendorId", device.getVendorId());
+        obj.put("productId", device.getProductId());
+        obj.put("deviceClass", device.getDeviceClass());
+        obj.put("interfaceCount", device.getInterfaceCount());
+        try { obj.put("productName", device.getProductName()); } catch (Exception ignored) {}
+        try { obj.put("manufacturerName", device.getManufacturerName()); } catch (Exception ignored) {}
+        if (usbManager != null) {
+            try { obj.put("hasPermission", usbManager.hasPermission(device)); } catch (Exception ignored) {}
+            try { obj.put("serialNumber", device.getSerialNumber()); } catch (Exception ignored) {}
+        }
+        JSONArray interfaces = new JSONArray();
+        for (int i = 0; i < device.getInterfaceCount(); i++) {
+            UsbInterface usbInterface = device.getInterface(i);
+            JSONObject ifaceObj = new JSONObject();
+            ifaceObj.put("id", usbInterface.getId());
+            ifaceObj.put("class", usbInterface.getInterfaceClass());
+            ifaceObj.put("subclass", usbInterface.getInterfaceSubclass());
+            ifaceObj.put("protocol", usbInterface.getInterfaceProtocol());
+            JSONArray endpoints = new JSONArray();
+            for (int e = 0; e < usbInterface.getEndpointCount(); e++) {
+                UsbEndpoint endpoint = usbInterface.getEndpoint(e);
+                endpoints.put(new JSONObject()
+                    .put("address", endpoint.getAddress())
+                    .put("type", endpoint.getType())
+                    .put("direction", endpoint.getDirection() == UsbConstants.USB_DIR_OUT ? "out" : "in")
+                    .put("maxPacketSize", endpoint.getMaxPacketSize()));
+            }
+            ifaceObj.put("endpoints", endpoints);
+            interfaces.put(ifaceObj);
+        }
+        obj.put("interfaces", interfaces);
+        return obj;
+    }
+
+    private void getUsbDiagnostics(CallbackContext callbackContext) {
+        try {
+            JSONObject result = new JSONObject();
+            result.put("timestamp", System.currentTimeMillis());
+            result.put("uptimeMs", SystemClock.elapsedRealtime());
+            result.put("device", Build.MANUFACTURER + " " + Build.MODEL + " (SDK " + Build.VERSION.SDK_INT + ", " + Build.DISPLAY + ")");
+            // If the receiver failed to register, the cache is only cleared on detach and on print failure
+            result.put("receiverRegistered", isUsbDiagnosticsReceiverRegistered);
+            result.put("eventListenerAttached", usbEventListener != null);
+            result.put("verboseLogging", USB_DIAG_VERBOSE);
+            result.put("power", readPowerState());
+
+            Intent usbState = cordova.getActivity().getApplicationContext()
+                .registerReceiver(null, new IntentFilter(ACTION_USB_STATE));
+            if (usbState != null && usbState.getExtras() != null) {
+                JSONObject extras = new JSONObject();
+                for (String key : usbState.getExtras().keySet()) {
+                    Object value = usbState.getExtras().get(key);
+                    extras.put(key, value == null ? JSONObject.NULL : String.valueOf(value));
+                }
+                result.put("usbState", extras);
+            }
+
+            UsbManager usbManager = (UsbManager) cordova.getActivity().getSystemService(Context.USB_SERVICE);
+            JSONArray devices = new JSONArray();
+            if (usbManager != null) {
+                for (UsbDevice device : usbManager.getDeviceList().values()) {
+                    devices.put(describeUsbDevice(device, usbManager));
+                }
+            }
+            result.put("usbDevices", devices);
+
+            JSONArray cache = new JSONArray();
+            synchronized (connections) {
+                for (String key : connections.keySet()) {
+                    DeviceConnection connection = connections.get(key);
+                    JSONObject entry = new JSONObject();
+                    entry.put("key", key);
+                    entry.put("isConnected", connection != null && connection.isConnected());
+                    if (connection instanceof UsbConnection && ((UsbConnection) connection).getDevice() != null) {
+                        UsbDevice cachedDevice = ((UsbConnection) connection).getDevice();
+                        entry.put("deviceName", cachedDevice.getDeviceName());
+                        entry.put("deviceId", cachedDevice.getDeviceId());
                     }
+                    cache.put(entry);
                 }
-                connections.remove(key);
             }
+            result.put("connectionCache", cache);
+
+            JSONArray events = new JSONArray();
+            synchronized (usbEventHistory) {
+                for (JSONObject event : usbEventHistory) {
+                    events.put(event);
+                }
+            }
+            result.put("recentEvents", events);
+
+            android.util.Log.i(USB_DIAG_TAG, "[diagnostics] devices=" + devices.length() + " cache=" + cache);
+            callbackContext.success(result);
+        } catch (Exception e) {
+            final String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            android.util.Log.e(USB_DIAG_TAG, "[diagnostics] error: " + errorMsg, e);
+            callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
+                put("error", errorMsg);
+            }}));
         }
     }
 
@@ -173,6 +617,10 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                     } catch (JSONException e) {
                         e.printStackTrace();
                     }
+                } else if (action.equals("getUsbDiagnostics")) {
+                    ThermalPrinterCordovaPlugin.this.getUsbDiagnostics(callbackContext);
+                } else if (action.equals("registerUsbEventListener")) {
+                    ThermalPrinterCordovaPlugin.this.registerUsbEventListener(callbackContext);
                 } else if (action.startsWith("printFormattedText")) {
                     ThermalPrinterCordovaPlugin.this.printFormattedText(callbackContext, action, args.getJSONObject(0));
                 } else if (action.equals("getEncoding")) {
@@ -387,7 +835,29 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             return;
         }
 
-        EscPosPrinter printer = this.getPrinter(callbackContext, data);
+        final long jobId = printJobSequence.incrementAndGet();
+        final long jobStart = SystemClock.elapsedRealtime();
+        final boolean isUsb = "usb".equals(data.optString("type"));
+        if (isUsb && USB_DIAG_VERBOSE) {
+            android.util.Log.i(USB_DIAG_TAG, "[print #" + jobId + "] start key=" + buildConnectionKey(data)
+                + " id=" + data.optString("id") + " textLength=" + data.optString("text").length()
+                + " usbDeviceCount=" + countUsbDevices());
+        }
+
+        EscPosPrinter printer;
+        try {
+            printer = this.getPrinter(callbackContext, data);
+        } catch (JSONException e) {
+            if (isUsb) {
+                android.util.Log.e(USB_DIAG_TAG, "[print #" + jobId + "] getPrinter failed after "
+                    + (SystemClock.elapsedRealtime() - jobStart) + "ms: " + e.getMessage());
+            }
+            throw e;
+        }
+        if (isUsb && USB_DIAG_VERBOSE) {
+            android.util.Log.i(USB_DIAG_TAG, "[print #" + jobId + "] printer ready after "
+                + (SystemClock.elapsedRealtime() - jobStart) + "ms");
+        }
         try {
             // Read printerModel parameter (optional)
             String printerModel = data.optString("printerModel", "");
@@ -405,9 +875,18 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             } else {
                 printer.printFormattedText(data.getString("text"), dotsFeedPaper);
             }
+            if (isUsb && USB_DIAG_VERBOSE) {
+                android.util.Log.i(USB_DIAG_TAG, "[print #" + jobId + "] success in "
+                    + (SystemClock.elapsedRealtime() - jobStart) + "ms");
+            }
             callbackContext.success();
         } catch (EscPosConnectionException e) {
             final String errorMsg = e.getMessage() != null ? e.getMessage() : "EscPosConnectionException occurred";
+            if (isUsb) {
+                android.util.Log.e(USB_DIAG_TAG, "[print #" + jobId + "] CONNECTION_ERROR after "
+                    + (SystemClock.elapsedRealtime() - jobStart) + "ms: " + errorMsg);
+                clearUsbConnections("print connection error");
+            }
             android.util.Log.e("ThermalPrinter", "Print connection error: " + errorMsg, e);
             callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
                 put("error", "Connection error: " + errorMsg);
@@ -415,6 +894,13 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             }}));
         } catch (Exception e) {
             final String errorMsg = e.getMessage() != null ? e.getMessage() : "Unknown error during print: " + e.getClass().getSimpleName();
+            if (isUsb) {
+                android.util.Log.e(USB_DIAG_TAG, "[print #" + jobId + "] PRINT_ERROR after "
+                    + (SystemClock.elapsedRealtime() - jobStart) + "ms: " + errorMsg);
+                // Kept deliberately broad: any unexpected failure on a USB print may leave the connection
+                // unusable, and the cost of dropping it is one re-enumeration on the next print.
+                clearUsbConnections("print error");
+            }
             android.util.Log.e("ThermalPrinter", "Print error: " + errorMsg, e);
             callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
                 put("error", errorMsg);
@@ -631,16 +1117,24 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                 return false;
             }
             
+            int deviceId = cachedDevice.getDeviceId();
             int vendorId = cachedDevice.getVendorId();
             int productId = cachedDevice.getProductId();
             String serial = "";
-            try { 
-                serial = cachedDevice.getSerialNumber(); 
+            try {
+                serial = cachedDevice.getSerialNumber();
             } catch (Exception ignored) {}
-            
+
             HashMap<String, UsbDevice> deviceList = usbManager.getDeviceList();
             for (UsbDevice device : deviceList.values()) {
-                // Match by vendorId + productId (deviceId changes after reconnect!)
+                // deviceId is the one identifier that DOES change when the device re-enumerates, and the
+                // open file descriptor dies with the old enumeration. A vendor/product/serial match on a
+                // new deviceId is the same printer but not the same connection: the cached UsbConnection
+                // would still report isConnected() (outputStream != null) and then fail in claimInterface.
+                if (device.getDeviceId() != deviceId) {
+                    continue;
+                }
+                // Match by vendorId + productId, to be sure the reused deviceId is the same device
                 if (device.getVendorId() == vendorId && device.getProductId() == productId) {
                     // If we have serial for cached device, verify it matches
                     if (serial != null && !serial.isEmpty()) {

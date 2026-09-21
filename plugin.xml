@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
-    id="thermal-printer-cordova-plugin" version="1.1.0">
+    id="thermal-printer-cordova-plugin" version="1.2.0">
     <name>Cordova Plugin ESCPOS Printer</name>
     <description>Cordova wrapper for ESC/POS Thermal Printer and Urovo/Gertec internal printer support</description>
     <license>Apache 2.0</license>
@@ -12,6 +12,7 @@
         <config-file target="res/xml/config.xml" parent="/*">
             <feature name="ThermalPrinter">
                 <param name="android-package" value="de.paystory.thermal_printer.ThermalPrinterCordovaPlugin" />
+                <param name="onload" value="true" />
             </feature>
         </config-file>
 

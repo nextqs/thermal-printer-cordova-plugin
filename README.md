@@ -196,6 +196,15 @@ ThermalPrinter.listPrinters({type: 'usb'}, function(printers) {
 });
 ```
 
+**Reconnection handling (since v1.2.0):** USB connections are cached, and the cache is keyed by
+`vendorId`/`productId`/`serialNumber`, which do not change when a device re-enumerates. The plugin
+therefore also checks the `deviceId` of the cached device against the bus before reusing a connection,
+because `deviceId` does change on re-enumeration and the open file descriptor dies with the old one.
+Reusing a stale connection would fail with `Error during claim USB interface`. The cache is additionally
+dropped when the device is detached, when a device comes back re-enumerated, and after a failed USB print.
+This matters on OTG adapters that let the printer leave the bus — see [onUsbEvent](#onUsbEvent) to react
+to it from the app.
+
 ### listPrinters(data, successCallback, errorCallback)
 
 List available printers
@@ -296,6 +305,59 @@ Request permissions for USB printers
 | [data.port]     | <code>number</code>                                                                                | If type is "tcp" then the Port of the printer                                              |
 | successCallback | <code>function</code>                                                                              | Result on success                                                                          |
 | errorCallback   | <code>function</code>                                                                              | Result on failure                                                                          |
+
+<a name="getUsbDiagnostics"></a>
+
+### getUsbDiagnostics(successCallback, errorCallback)
+
+**Available since v1.2.0** — Returns a snapshot of the USB subsystem: devices reported by `UsbManager`
+(with interfaces, endpoints and permission state), the plugin's connection cache, the sticky `USB_STATE`
+extras, the current power/battery state, the most recent USB, power and screen events, and whether the
+plugin's USB/power receiver is registered (`receiverRegistered`).
+
+Useful when diagnosing field issues with OTG adapters, where the printer may leave the bus entirely.
+TypeScript consumers can import the returned shape as `UsbDiagnostics`.
+
+| Param           | Type                  | Description        |
+| --------------- | --------------------- | ------------------ |
+| successCallback | <code>function</code> | Result on success  |
+| errorCallback   | <code>function</code> | Result on failure  |
+
+Returned object:
+
+| Field                  | Type                  | Description                                                                                       |
+| ---------------------- | --------------------- | ------------------------------------------------------------------------------------------------- |
+| timestamp, uptimeMs    | <code>number</code>   | Wall clock and `SystemClock.elapsedRealtime()` of the snapshot                                     |
+| device                 | <code>string</code>   | Manufacturer, model, SDK level and build                                                          |
+| receiverRegistered     | <code>boolean</code>  | `false` means the cache is only cleared on detach and on print failure                             |
+| eventListenerAttached  | <code>boolean</code>  | Whether `onUsbEvent` currently has a subscriber                                                    |
+| verboseLogging         | <code>boolean</code>  | Whether the per-print debug logging is compiled in                                                 |
+| power                  | <code>object</code>   | `plugged`, `pluggedLabel`, `status`, `levelPercent`, `voltageMv`                                    |
+| usbState               | <code>object</code>   | Sticky `USB_STATE` extras, stringified                                                            |
+| usbDevices             | <code>Array</code>    | Devices on the bus, each with `deviceId`, ids, `interfaces` and `endpoints`                        |
+| connectionCache        | <code>Array</code>    | The plugin's cached connections, with the `deviceId` each one was opened against                   |
+| recentEvents           | <code>Array</code>    | Up to the last 200 USB, power and screen events                                                   |
+
+<a name="onUsbEvent"></a>
+
+### onUsbEvent(eventCallback, errorCallback)
+
+**Available since v1.2.0** — Subscribes to USB attach/detach, `USB_STATE`, power and screen events.
+The callback is kept and invoked for every event, each one carrying the action, the battery/power state and
+the number of USB devices currently on the bus. Attach and detach events also carry the device descriptor.
+TypeScript consumers can import the event shape as `UsbEvent`.
+
+Typical use: react to `android.hardware.usb.action.USB_DEVICE_ATTACHED` to retry a print as soon as a
+printer that dropped off the bus comes back. By the time the event reaches the callback, the plugin has
+already dropped any cached connection whose device came back re-enumerated, so a print started from the
+callback opens a fresh connection.
+
+Subscribe once: calling it again replaces the previous subscription and releases the earlier callback.
+
+| Param         | Type                  | Description                 |
+| ------------- | --------------------- | --------------------------- |
+| eventCallback | <code>function</code> | Called for every event      |
+| errorCallback | <code>function</code> | Result on failure           |
 
 <a name="bitmapToHexadecimalString"></a>
 
