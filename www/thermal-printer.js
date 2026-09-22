@@ -2,6 +2,18 @@
 
 module.exports = {
   /**
+   * Query ESC/POS paper and cover sensors over USB (experimental, since v1.2.0).
+   * Unknown sensor values are null; a missing reply must not prevent ticket issuance.
+   *
+   * @param {Object} data - USB selector: type, id, optional vendorId/productId/serialNumber
+   * @param {function} successCallback - Snapshot, including unknown/unsupported/busy states
+   * @param {function} errorCallback - Invalid arguments or bridge failure
+   */
+  getPrinterStatus: function (data, successCallback, errorCallback) {
+    cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'getPrinterStatus', [data]);
+  },
+
+  /**
    * List available printers
    *
    * @param {Object} data - Data object

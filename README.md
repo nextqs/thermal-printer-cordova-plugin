@@ -308,6 +308,131 @@ Request permissions for USB printers
 
 <a name="getUsbDiagnostics"></a>
 
+### getPrinterStatus(data, successCallback, errorCallback)
+
+**Experimental, since v1.2.0 — USB only.** Queries the USB printer class `GET_PORT_STATUS`
+(paper), then ESC/POS `DLE EOT 4` (paper, near end) and `DLE EOT 2` (cover). Pass the same USB
+selector as printing (`type`, `id`, optional `vendorId`, `productId`, `serialNumber`); request
+USB permission beforehand.
+
+```javascript
+ThermalPrinter.getPrinterStatus(
+  { type: 'usb', id: printer.deviceId, vendorId: printer.vendorId, productId: printer.productId },
+  function (status) {
+    console.log('USB printer status:', JSON.stringify(status));
+    if (status.paperPresent === false) console.log('Paper is absent');
+    if (status.coverOpen === true) console.log('Cover is open');
+    // null means unknown. Never block ticket issuance because a query did not answer.
+  },
+  function (error) { console.error('Status request failed:', error); }
+);
+```
+
+| Result | Meaning |
+| --- | --- |
+| `paperPresent` | `true` / `false` / `null` (unknown) |
+| `paperNearEnd` | `true` / `false` / `null`; requires the corresponding sensor |
+| `coverOpen` | `true` / `false` / `null`; requires the model to implement the standard cover bit |
+| `printerStopped` | `true` / `false` / `null`; class error bit. `true` means the printer stopped without naming a cause, so treat it as blocking and do not report a specific cause to the operator |
+| `supported` | `true`: at least one valid reply; `false`: unsupported transport or missing bulk endpoints; `null`: undetermined |
+| `raw` | `{ paper: number[], offline: number[], port: number[] }`, unsigned response bytes, including invalid replies; `[]` when none read |
+| `reason` | `null` for a complete standard reply; otherwise one of the reasons below |
+
+Reasons: `busy`, `device_not_found`, `permission_required`, `unsupported_transport`,
+`no_status_endpoint`, `interface_unavailable`, `input_not_quiet`, `timeout`, `write_timeout`,
+`invalid_response`, `io_error`, `partial`. These are **successful API responses**, not print errors.
+`partial` means the class request answered but `DLE EOT` did not, so paper is known while cover and
+near end are `null`. `write_timeout` means the printer stopped draining its bulk OUT pipe: its
+receive buffer is full, which is itself a sign that it is offline.
+Malformed arguments use the error callback. Partial results are possible: paper may be known
+while cover is `null`. A timeout cannot establish whether the printer supports the command.
+
+Printing is serialized against status queries. Only `printFormattedText*` takes the USB lock, and it
+takes it with a bounded wait: discovery, disconnect, diagnostics and image conversion stay outside it,
+because a native write blocks in `requestWait()` with no deadline and holding those behind a wedged
+print leaves the OTG recovery with no way back. A query returns `busy` immediately if a print
+holds the lock or is waiting. Otherwise it releases cached printing connections for
+the selected device, opens a temporary connection, claims the same printer interface with
+`force=false`, retrying and forcing only on the last attempt, and always closes it before allowing
+another operation. The next print reconnects
+normally. This keeps library version 3.6.0 and avoids access to its private fields. A print arriving
+during the query can wait for its bounded USB transfers: 400 ms per query, with a 1500 ms total
+budget (Android open/claim/close and scheduling overhead are additional). A reply is polled every
+5 ms, because an IN transfer with nothing pending returns 0 at once rather than waiting out its
+timeout. A model that accepts `DLE EOT` and never answers is remembered by vendor/product and
+skipped on later queries, so it costs the read budget only once. Avoid tight polling.
+The existing detach, re-enumeration and print-failure recovery remains in place.
+
+Old input is drained with a bounded loop. Replies must contain exactly one byte matching
+`0xx1xx10b`; **bit 4 is 1**, as specified in the
+[Epson DLE EOT reference](https://download4.epson.biz/sec_pubs/pos/reference_en/escpos/dle_eot.html).
+Paper uses masks `0x60` and `0x0C`; mixed sensor bit pairs remain unknown. Cover uses `0x04`
+from the offline response. After a missing/invalid paper response, the cover command is skipped
+to avoid interpreting a late paper reply as cover status. Responses have no command identifiers;
+model-specific delayed/unsolicited data still requires bench validation.
+
+**Validated models.** EPSON TM-T20X (vendor `1208`, product `3623`) on Samsung SM-X236B, 2026-09-22.
+
+`GET_PORT_STATUS` answers in under 2 ms in every state. Measured bytes: `0x18` ready, `0x10` cover
+open with paper loaded, `0x30` out of paper with the cover closed. Bit 3 (Not Error) separates ready
+from stopped in all three, which is what `printerStopped` reports; bit 5 separates out-of-paper from
+the other causes.
+
+`DLE EOT` works on this model **only while it is ready**, where it replies `0x12` to both commands in
+about 6 ms and fills `coverOpen` and `paperNearEnd` with `reason: null`. The moment the printer stops
+it goes silent, contrary to the ESC/POS promise that real-time commands are answered offline. So the
+fields that would name the cause disappear exactly when a cause exists: in practice **cover open
+surfaces as `printerStopped`, not as `coverOpen`**, and the class byte is the only source that
+survives a fault. Once the receive buffer fills, the `DLE EOT` write itself fails (`write_timeout`)
+while the class request keeps answering.
+
+Because of this, silence is only taken as proof that a model never answers `DLE EOT` when it comes
+from a printer reporting ready; silence from a stopped printer says nothing about the model and must
+not disable the command. A valid reply does not prove that every sensor exists.
+
+**`paperNearEnd` is unusable on this model.** With a roll holding exactly one more ticket, the paper
+byte still read `0x12` — near-end bits clear, "paper adequate" — and one second after that ticket
+printed the class byte went straight to `0x30`, out of paper. The model reports no intermediate state,
+so the field never warns in time to change the roll, which is its only purpose. Treat it as absent
+here and do not read `paperNearEnd: false` as evidence that a near-end sensor exists.
+
+Note for bench work: the red stripe printed near the core of a thermal roll is a visual cue for the
+operator. Nothing in the paper path can read it, and it has no relation to `paperNearEnd`, which
+measures the remaining roll diameter through a separate sensor when the model has one.
+Do not assume `paperNearEnd: false` proves a near-end sensor is installed. A snapshot is not
+confirmation that a ticket printed, and some models retain the prior paper state while the cover
+is open. Bluetooth, TCP and internal Urovo/Gertec status are outside this API's scope.
+
+#### USB status bench validation
+
+Install this `sandbox` checkout in the test application, sync/rebuild Android, and call the API
+after USB permission is granted. For every model/firmware, record `raw`, the decoded fields,
+`supported`, `reason`, elapsed time and the observed physical condition for every row:
+
+| Scenario | Expected observation |
+| --- | --- |
+| Paper loaded, cover closed | `paperPresent: true`, `coverOpen: false` |
+| Paper removed, cover closed | `paperPresent: false` |
+| Paper near end, if sensor exists | `paperNearEnd: true`; otherwise mark sensor unavailable |
+| Cover open, with and without paper | `coverOpen: true`, or `printerStopped: true` on models that go silent while stopped; record whether paper state is retained |
+| Printer powered off / cable removed | Unknown result, no indefinite wait or blocked ticket issuance |
+| Query during a long print | `busy`, no interruption, truncation or duplicated ticket |
+| Print immediately after starting a query | Print resumes after the bounded query, including timeout |
+| Silent/unsupported printer or no input endpoint | Unknown/unsupported, no false paper/cover alarm |
+| Repeated queries, including after a timeout | No old paper byte interpreted as cover; print still works |
+| Same printer addressed by legacy id and stable ids | Cached aliases released, no claim conflict |
+| Unstable cable, detach/replug and re-enumeration | Normal printing and the app's existing automatic reprint recover as before |
+| Two USB printers / unrelated hub attach | Query leaves the other device's cached connection intact |
+
+Record approved models and their reliable bits here only after this procedure is completed.
+Every query logs its outcome unconditionally under the `ThermalPrinter` tag: `[status] port read=…`,
+`[status] n=… read=… after … polls`, and the full snapshot. Filter logcat with
+`ThermalPrinter:I ThermalPrinterUsbDiag:I Capacitor/Console:V '*:S'`. The wider `ThermalPrinterUsbDiag`
+event trace is still gated by `USB_DIAG_VERBOSE`.
+
+Before each scenario, power-cycle the printer. A printer left offline keeps a full receive buffer and
+will fail the `DLE EOT` write of the next run, which invalidates the reading.
+
 ### getUsbDiagnostics(successCallback, errorCallback)
 
 **Available since v1.2.0** — Returns a snapshot of the USB subsystem: devices reported by `UsbManager`

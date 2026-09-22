@@ -3,3 +3,4 @@
 /dist
 /src/android/.gradle
 /src/android/build
+.ia-temp/

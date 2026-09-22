@@ -12,6 +12,7 @@ export interface Printer {
     deviceId?: number;
     serialNumber?: string;
     vendorId?: number;
+    productId?: number;
 
     // Internal Android printer (Gertec GPOS820 / Urovo-compatible runtime)
     id?: string;
@@ -26,6 +27,10 @@ export interface PrinterToUse {
     id: string | number;
     address?: string;
     port?: number;
+    /** Stable USB identifiers used after the device re-enumerates. */
+    vendorId?: number;
+    productId?: number;
+    serialNumber?: string;
 }
 
 export interface PrintFormattedText extends PrinterToUse {
@@ -199,7 +204,38 @@ export interface UsbDiagnostics {
     recentEvents?: UsbEvent[];
 }
 
+export interface GetPrinterStatus extends PrinterToUse {
+    type: 'usb';
+}
+
+export type PrinterStatusReason = 'unsupported_transport' | 'busy' | 'device_not_found'
+    | 'permission_required' | 'no_status_endpoint' | 'interface_unavailable'
+    | 'input_not_quiet' | 'timeout' | 'write_timeout' | 'invalid_response' | 'io_error' | 'partial';
+
+/** Experimental ESC/POS USB snapshot; null always means unknown, never a printer fault. */
+export interface PrinterStatus {
+    /** True when at least one valid DLE EOT reply was received; null when support is unknown. */
+    supported: boolean | null;
+    paperPresent: boolean | null;
+    /** Requires a near-end sensor on the printer. */
+    paperNearEnd: boolean | null;
+    /** Requires the model to implement the standard offline-status cover bit. */
+    coverOpen: boolean | null;
+    /** USB printer class error bit: the printer stopped, without saying why. Blocks printing. */
+    printerStopped: boolean | null;
+    /** Raw unsigned bytes, including malformed replies; empty arrays mean no reply was read. */
+    raw: { paper: number[]; offline: number[]; port: number[]; };
+    reason: PrinterStatusReason | null;
+}
+
 export interface ThermalPrinterPlugin {
+  /**
+   * Query paper/cover sensors over USB. Available since v1.2.0; validate each model on the bench.
+   * Busy, absent, unsupported and silent printers use the success callback with unknown fields.
+   * Never block ticket issuance on null fields or supported !== true.
+   */
+  getPrinterStatus?(data: GetPrinterStatus, success: (value: PrinterStatus) => void, error: (value: ErrorResult) => void): void;
+
   /**
    * List available printers
    *
