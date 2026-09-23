@@ -88,5 +88,7 @@ with tempfile.TemporaryDirectory(prefix="thermal-usb-status-") as temp:
         str(ROOT / "src/android/ThermalPrinterCordovaPlugin.java"))
     classpath = str(classes) + os.pathsep + classpath
     run("javac", "-proc:none", "-cp", classpath, "-d", str(classes),
-        str(ROOT / "tests/stubs/android/os/SystemClock.java"), str(ROOT / "tests/UsbPrinterStatusTest.java"))
+        str(ROOT / "tests/stubs/android/os/SystemClock.java"),
+        str(ROOT / "tests/stubs/android/content/BroadcastReceiver.java"),
+        str(ROOT / "tests/UsbPrinterStatusTest.java"))
     run("java", f"-javaagent:{agent}", "-cp", classpath, "de.paystory.thermal_printer.UsbPrinterStatusTest")

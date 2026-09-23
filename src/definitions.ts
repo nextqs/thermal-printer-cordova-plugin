@@ -214,8 +214,9 @@ export type PrinterStatusReason = 'unsupported_transport' | 'busy' | 'device_not
 
 /** Experimental ESC/POS USB snapshot; null always means unknown, never a printer fault. */
 export interface PrinterStatus {
-    /** True when at least one valid DLE EOT reply was received; null when support is unknown. */
+    /** True when at least one valid USB class or DLE EOT reply was received; null when support is unknown. */
     supported: boolean | null;
+    /** Decoded independently from the available paper source; null means it was not established. */
     paperPresent: boolean | null;
     /** Requires a near-end sensor on the printer. */
     paperNearEnd: boolean | null;

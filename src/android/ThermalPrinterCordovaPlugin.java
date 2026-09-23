@@ -87,7 +87,7 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     private final HashMap<String, DeviceConnection> connections = new HashMap<>();
     // vendor:product of printers that accept DLE EOT and never reply, so the next query skips it.
     private final HashSet<String> usbSilentToDleEot = new HashSet<>();
-    // Covers entire USB actions, not just cache access: status must never claim an interface in use.
+    // Serializes USB writers and status. Recovery may close cached writers without opening new ones.
     private final ReentrantLock usbOperationLock = new ReentrantLock(true);
     // The TM-T20X accepted DLE EOT but did not answer inside 120 ms. Widen the budget to find the real
     // latency; tighten it again once a bench run shows what each model actually needs.
@@ -169,15 +169,15 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
         removeUsbConnections(keys, expected, reason);
     }
 
-    /** Drop only the failed writer and its aliases, preserving any replacement and other devices. */
-    private void removeFailedUsbConnection(DeviceConnection failed, String reason) {
-        if (!(failed instanceof UsbConnection)) {
+    /** Drop only the selected writer and its aliases, preserving any replacement and other devices. */
+    private void removeUsbWriter(DeviceConnection writer, String reason) {
+        if (!(writer instanceof UsbConnection)) {
             return;
         }
         synchronized (connections) {
             ArrayList<String> keys = new ArrayList<>();
             for (String key : connections.keySet()) {
-                if (connections.get(key) == failed) {
+                if (connections.get(key) == writer) {
                     keys.add(key);
                 }
             }
@@ -185,9 +185,9 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                 connections.remove(key);
             }
         }
-        // The writer may already have left the cache. Close the actual failed object, never its replacement.
+        // The writer may already have left the cache. Close the selected object, never its replacement.
         try {
-            failed.disconnect();
+            writer.disconnect();
         } catch (Exception e) {
             android.util.Log.w("ThermalPrinter", "Failed to disconnect USB writer: " + reason, e);
         }
@@ -643,18 +643,16 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                     return;
                 }
                 JSONObject actionData = args.optJSONObject(0);
-                // Only the writer has to exclude a status query, because it is the only action that claims
-                // the interface. Discovery, disconnect, diagnostics and image conversion stay outside this
-                // lock deliberately: a native write blocks in requestWait() with no deadline, and holding
-                // them behind a wedged print leaves the OTG recovery with no way back to the printer.
+                // EscPosPrinter's constructor opens a writer even for encoding and image conversion.
+                // Exclude these actions from status too. USB disconnect only closes cached writers;
+                // permissions/discovery/diagnostics do not open handles and must remain usable for recovery.
                 // getDevice also treats legacy/unknown transport names as USB, so cover that fallback here.
-                if (action.startsWith("printFormattedText") && actionData != null
+                if ((action.startsWith("printFormattedText") || action.equals("getEncoding")
+                    || action.equals("bitmapToHexadecimalString")) && actionData != null
                     && !"bluetooth".equals(actionData.optString("type"))
                     && !"tcp".equals(actionData.optString("type")) && !isInternalUrovo(actionData)) {
-                    // A native USB write ends in requestWait(), which has no deadline: an offline printer
-                    // can park this thread for good. Bound the wait so a stuck write cannot hold the lock
-                    // forever and deadlock listPrinters and disconnectPrinter, the two actions the OTG
-                    // recovery needs to get the printer back.
+                    // A native write may never return. Bound the wait of subsequent writer actions;
+                    // disconnect remains outside the lock so it can close the stalled writer.
                     try {
                         if (!usbOperationLock.tryLock(USB_ACTION_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                             android.util.Log.w("ThermalPrinter", "[lock] " + action + " gave up waiting for the USB lock");
@@ -781,8 +779,9 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
         }
 
         // The current library does not expose its native handle. Release all aliases for this device
-        // before opening a temporary handle. All USB bridge operations share usbOperationLock, so no
+        // before opening a temporary handle. Actions that open writers share usbOperationLock, so no
         // writer can open/reclaim the interface until the temporary handle has been closed below.
+        // USB disconnect only closes cached writers; permissions never open or cache a writer.
         ArrayList<String> keys = new ArrayList<>();
         HashMap<String, DeviceConnection> expected = new HashMap<>();
         synchronized (connections) {
@@ -1045,7 +1044,7 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             return;
         }
 
-        DeviceConnection connection = ThermalPrinterCordovaPlugin.this.getPrinterConnection(callbackContext, data);
+        DeviceConnection connection = getPrinterConnection(callbackContext, data, false);
         if (connection != null) {
             // Use stable key instead of deviceId (which changes after unplug/replug)
             String intentName = "thermalPrinterUSBRequest-" + buildConnectionKey(data);
@@ -1215,7 +1214,7 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             printer = this.getPrinter(callbackContext, data, printConnection);
         } catch (JSONException e) {
             if (e.getCause() instanceof EscPosConnectionException) {
-                removeFailedUsbConnection(printConnection, "print connection setup error");
+                removeUsbWriter(printConnection, "print connection setup error");
             }
             if (isUsb) {
                 android.util.Log.e(USB_DIAG_TAG, "[print #" + jobId + "] getPrinter failed after "
@@ -1258,7 +1257,7 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                 android.util.Log.e(USB_DIAG_TAG, "[print #" + jobId + "] CONNECTION_ERROR after "
                     + (SystemClock.elapsedRealtime() - jobStart) + "ms: " + errorMsg);
             }
-            removeFailedUsbConnection(printConnection, "print connection error");
+            removeUsbWriter(printConnection, "print connection error");
             android.util.Log.e("ThermalPrinter", "Print connection error: " + errorMsg, e);
             callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
                 put("error", "Connection error: " + errorMsg);
@@ -1273,7 +1272,7 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             // Once rendering starts, even a formatting failure may leave buffered commands. Retire only
             // this writer so the next ticket cannot inherit them. Invalid arguments before rendering keep it.
             if (printStarted) {
-                removeFailedUsbConnection(printConnection, "print error after rendering started");
+                removeUsbWriter(printConnection, "print error after rendering started");
             }
             android.util.Log.e("ThermalPrinter", "Print error: " + errorMsg, e);
             callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
@@ -1311,9 +1310,79 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             return;
         }
 
+        String type = data.getString("type");
+        if (!"bluetooth".equals(type) && !"tcp".equals(type)) {
+            // The kiosk calls this with only type/id after a timed-out USB write, while the writer
+            // remains cached under vendor/product/serial. Never construct EscPosPrinter here: opening
+            // a second handle would neither close that writer nor be safe during a status query.
+            disconnectCachedUsbPrinter(data);
+            callbackContext.success();
+            return;
+        }
+
         EscPosPrinter printer = this.getPrinter(callbackContext, data);
         printer.disconnectPrinter();
         callbackContext.success();
+    }
+
+    private void disconnectCachedUsbPrinter(JSONObject data) throws JSONException {
+        String key = buildConnectionKey(data);
+        String id = data.optString("id");
+        int vendorId = data.optInt("vendorId", -1);
+        int productId = data.optInt("productId", -1);
+        String serial = data.optString("serialNumber", "").trim();
+        HashSet<DeviceConnection> selected = new HashSet<>();
+        HashMap<String, DeviceConnection> snapshot;
+        synchronized (connections) {
+            snapshot = new HashMap<>(connections);
+        }
+        DeviceConnection exact = snapshot.get(key);
+        if (exact instanceof UsbConnection) {
+            selected.add(exact);
+        }
+        for (DeviceConnection cached : snapshot.values()) {
+            if (!selected.isEmpty()) {
+                break;
+            }
+            if (!(cached instanceof UsbConnection)) {
+                continue;
+            }
+            UsbDevice device = ((UsbConnection) cached).getDevice();
+            if (device != null) {
+                if (vendorId > 0 && productId > 0) {
+                    if (device.getVendorId() == vendorId && device.getProductId() == productId) {
+                        try {
+                            if (serial.isEmpty() || serial.equals(device.getSerialNumber())) {
+                                selected.add(cached);
+                            }
+                        } catch (SecurityException ignored) {
+                            // With an unreadable serial, only an exact cache key is safe to close.
+                        }
+                    }
+                } else if (!id.isEmpty() && (id.equals(String.valueOf(device.getDeviceId()))
+                    || id.equals(device.getProductName() == null ? "" : device.getProductName().trim()))) {
+                    selected.add(cached);
+                }
+            }
+        }
+        // Include other cached handles of this enumeration, but never a second printer of the same model.
+        if (!selected.isEmpty()) {
+            UsbDevice target = ((UsbConnection) selected.iterator().next()).getDevice();
+            if (target != null) {
+                for (DeviceConnection cached : snapshot.values()) {
+                    if (cached instanceof UsbConnection) {
+                        UsbDevice device = ((UsbConnection) cached).getDevice();
+                        if (device != null && device.getDeviceId() == target.getDeviceId()
+                            && Objects.equals(device.getDeviceName(), target.getDeviceName())) {
+                            selected.add(cached);
+                        }
+                    }
+                }
+            }
+        }
+        for (DeviceConnection cached : selected) {
+            removeUsbWriter(cached, "explicit disconnect");
+        }
     }
 
     private String buildConnectionKey(JSONObject data) throws JSONException {
@@ -2198,6 +2267,11 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     }
 
     private DeviceConnection getPrinterConnection(CallbackContext callbackContext, JSONObject data) throws JSONException {
+        return getPrinterConnection(callbackContext, data, true);
+    }
+
+    private DeviceConnection getPrinterConnection(CallbackContext callbackContext, JSONObject data,
+                                                 boolean cacheWriter) throws JSONException {
         final String type = data.getString("type");
         final String id = data.optString("id", "");
         String hashKey = buildConnectionKey(data);
@@ -2215,7 +2289,7 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             }}));
         }
         // Thread-safe: cache the new connection
-        if (deviceConnection != null) {
+        if (cacheWriter && deviceConnection != null) {
             synchronized (connections) {
                 if (!this.connections.containsKey(hashKey)) {
                     this.connections.put(hashKey, deviceConnection);

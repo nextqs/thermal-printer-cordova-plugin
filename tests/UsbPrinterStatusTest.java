@@ -7,12 +7,20 @@ import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.hardware.usb.UsbEndpoint;
 import android.content.Context;
+import android.content.BroadcastReceiver;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.app.PendingIntent;
+import android.util.Base64;
+import android.graphics.BitmapFactory;
+import android.graphics.Bitmap;
 import android.util.Log;
 import android.os.SystemClock;
 import androidx.appcompat.app.AppCompatActivity;
 import com.dantsu.escposprinter.connection.DeviceConnection;
 import com.dantsu.escposprinter.connection.usb.UsbConnection;
 import com.dantsu.escposprinter.EscPosPrinter;
+import com.dantsu.escposprinter.textparser.PrinterTextParserImg;
 import com.dantsu.escposprinter.exceptions.EscPosConnectionException;
 import com.dantsu.escposprinter.exceptions.EscPosParserException;
 import org.apache.cordova.CallbackContext;
@@ -134,8 +142,11 @@ public class UsbPrinterStatusTest {
             result = unknown(plugin);
             check(query(plugin, result, new byte[0], -1, 3, 100L) == null, "expired deadline skips USB");
             check(result.getString("reason").equals("timeout"), "deadline reason");
+            portStatusChecks();
             cacheChecks();
+            detachFilterChecks();
             printFailureChecks();
+            usbActionChecks();
             integrationChecks();
             System.out.println("USB status checks passed: " + checks);
         }
@@ -259,6 +270,44 @@ public class UsbPrinterStatusTest {
             .put("vendorId", 1208).put("productId", 3623).put("text", "ticket");
     }
 
+    /** A detach event may close only aliases of the exact enumeration that left the bus. */
+    private static void detachFilterChecks() throws Exception {
+        ThermalPrinterCordovaPlugin plugin = new ThermalPrinterCordovaPlugin();
+        Field field = PLUGIN.getDeclaredField("connections");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        HashMap<String, DeviceConnection> cache = (HashMap<String, DeviceConnection>) field.get(plugin);
+        Class<?>[] detachTypes = { UsbDevice.class, String.class };
+
+        UsbDevice printerDevice = usbDevice(123, "/dev/bus/usb/001/002");
+        UsbConnection printer = mock(UsbConnection.class);
+        when(printer.getDevice()).thenReturn(printerDevice);
+        cache.put("usb-1208-3623", printer);
+        cache.put("usb-123", printer);
+
+        UsbDevice secondPrinterDevice = usbDevice(456, "/dev/bus/usb/001/003");
+        UsbConnection secondPrinter = mock(UsbConnection.class);
+        when(secondPrinter.getDevice()).thenReturn(secondPrinterDevice);
+        cache.put("usb-second-printer", secondPrinter);
+
+        // A keyboard/pendrive may even reuse the same numeric deviceId; the device name disambiguates it.
+        UsbDevice unrelated = usbDevice(123, "/dev/bus/usb/001/009");
+        invoke(plugin, "clearUsbConnectionsForDevice", detachTypes, unrelated, "unrelated detach");
+        check(cache.size() == 3 && cache.get("usb-1208-3623") == printer
+            && cache.get("usb-123") == printer && cache.get("usb-second-printer") == secondPrinter,
+            "unrelated detach preserves every printer connection");
+        verify(printer, never()).disconnect();
+        verify(secondPrinter, never()).disconnect();
+
+        // Detaching the selected enumeration removes all of its cache aliases.
+        invoke(plugin, "clearUsbConnectionsForDevice", detachTypes,
+            usbDevice(123, "/dev/bus/usb/001/002"), "printer detach");
+        check(cache.size() == 1 && cache.get("usb-second-printer") == secondPrinter,
+            "printer detach removes only aliases of the device that left");
+        verify(printer, times(2)).disconnect();
+        verify(secondPrinter, never()).disconnect();
+    }
+
     private static void printFailureChecks() throws Exception {
         for (String action : new String[] { "printFormattedText", "printFormattedTextAndCut" }) {
             for (boolean transportError : new boolean[] { true, false }) {
@@ -325,6 +374,201 @@ public class UsbPrinterStatusTest {
             "connection setup failure removes only the failed writer and its aliases");
         verify(setup.writer).disconnect();
         verify(unrelated, never()).disconnect();
+    }
+
+    /** Bench bytes are fixed expectations, independent of the masks used by production. */
+    private static void portStatusChecks() throws Exception {
+        // A silent DLE EOT must not erase the primary source's ready/paper state.
+        Fixture ready = new Fixture(-1, -1);
+        ready.portStatus(0x18, 1);
+        JSONObject result = ready.status();
+        check(result.getBoolean("supported"), "class-only reply establishes support");
+        check(result.getBoolean("paperPresent"), "0x18 means paper present even without DLE EOT");
+        check(!result.getBoolean("printerStopped"), "0x18 means printer ready");
+        check(result.isNull("coverOpen") && result.isNull("paperNearEnd"), "class-only ready leaves other sensors unknown");
+        check(result.getString("reason").equals("partial"), "class-only ready is a partial snapshot");
+        check(result.getJSONObject("raw").getJSONArray("port").toString().equals("[24]"), "preserve raw ready byte");
+        check(ready.commands.equals(Arrays.asList(4)), "ready printer attempts DLE EOT paper query");
+        verify(ready.handle).releaseInterface(ready.usbInterface);
+        verify(ready.handle).close();
+
+        // On the TM-T20X both faults stop the printer. The class byte does not identify an open cover.
+        for (int port : new int[] { 0x10, 0x30 }) {
+            Fixture stopped = new Fixture(0x12, 0x12); // Contradictory ready replies must never be queried.
+            stopped.portStatus(port, 1);
+            result = stopped.status();
+            check(result.getBoolean("supported"), "stopped class reply establishes support");
+            check(result.getBoolean("paperPresent") == (port == 0x10), "bench paper state preserved for " + port);
+            check(result.getBoolean("printerStopped"), "0x10 and 0x30 mean printer stopped");
+            check(result.isNull("coverOpen") && result.isNull("paperNearEnd"), "class fault does not guess cover or near-end");
+            check(result.getString("reason").equals("partial"), "stopped class reply is partial");
+            JSONObject raw = result.getJSONObject("raw");
+            check(raw.getJSONArray("port").length() == 1 && raw.getJSONArray("port").getInt(0) == port,
+                "preserve raw stopped byte");
+            check(raw.getJSONArray("paper").length() == 0 && raw.getJSONArray("offline").length() == 0,
+                "no fabricated DLE EOT evidence for a stopped printer");
+            check(stopped.commands.isEmpty(), "stopped printer skips DLE EOT");
+            verify(stopped.handle, never()).bulkTransfer(any(UsbEndpoint.class), any(byte[].class), anyInt(), anyInt());
+            verify(stopped.handle).releaseInterface(stopped.usbInterface);
+            verify(stopped.handle).close();
+        }
+
+        Fixture complete = new Fixture(0x12, 0x12);
+        complete.portStatus(0x18, 1);
+        result = complete.status();
+        check(result.getBoolean("supported") && result.getBoolean("paperPresent") && !result.getBoolean("printerStopped"),
+            "ready class state survives successful DLE EOT queries");
+        check(!result.getBoolean("coverOpen") && !result.getBoolean("paperNearEnd") && result.isNull("reason"),
+            "DLE EOT completes the class snapshot");
+        check(complete.commands.equals(Arrays.asList(4, 2)), "ready class reply permits both DLE EOT queries");
+        check(result.getJSONObject("raw").getJSONArray("port").toString().equals("[24]"), "complete snapshot retains class evidence");
+
+        // A failed/empty control transfer cannot turn an unused buffer byte into a printer fault.
+        for (int count : new int[] { -1, 0 }) {
+            Fixture fallback = new Fixture(0x12, 0x12);
+            fallback.portStatus(0x30, count);
+            result = fallback.status();
+            check(result.getBoolean("supported") && result.getBoolean("paperPresent"), "failed class query falls back to DLE EOT");
+            check(result.isNull("printerStopped"), "failed class query leaves stopped state unknown");
+            check(!result.getBoolean("coverOpen") && !result.getBoolean("paperNearEnd"), "fallback sensors still decoded");
+            check(result.getJSONObject("raw").getJSONArray("port").length() == 0, "failed transfer has no class evidence");
+            check(fallback.commands.equals(Arrays.asList(4, 2)), "failed class query does not suppress DLE EOT");
+        }
+    }
+
+    private static ReentrantLock usbLock(Fixture f) throws Exception {
+        Field field = PLUGIN.getDeclaredField("usbOperationLock");
+        field.setAccessible(true);
+        return (ReentrantLock) field.get(f.plugin);
+    }
+
+    /** Hold the native-operation lock from another thread, as a pending USB write would. */
+    private static class HeldUsbLock implements AutoCloseable {
+        final CountDownLatch release = new CountDownLatch(1);
+        final Thread holder;
+
+        HeldUsbLock(ReentrantLock lock) throws Exception {
+            CountDownLatch acquired = new CountDownLatch(1);
+            holder = new Thread(() -> {
+                lock.lock();
+                try {
+                    acquired.countDown();
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally { lock.unlock(); }
+            });
+            holder.start();
+            if (!acquired.await(2, TimeUnit.SECONDS)) throw new AssertionError("lock holder did not start");
+        }
+
+        public void close() throws Exception {
+            release.countDown();
+            holder.join(2000);
+            check(!holder.isAlive(), "lock holder terminates");
+        }
+    }
+
+    private static void usbActionChecks() throws Exception {
+        for (String action : new String[] { "getEncoding", "bitmapToHexadecimalString" }) {
+            Fixture f = new Fixture(0x12, 0x12);
+            ReentrantLock lock = usbLock(f);
+            try (HeldUsbLock held = new HeldUsbLock(lock);
+                 MockedConstruction<EscPosPrinter> printers = mockConstruction(EscPosPrinter.class)) {
+                CallbackContext callback = mock(CallbackContext.class);
+                long start = System.nanoTime();
+                f.plugin.execute(action, new JSONArray().put(printData().put("base64", "AA==")), callback);
+                check(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) < 7000, "writer wait is bounded");
+                ArgumentCaptor<JSONObject> error = ArgumentCaptor.forClass(JSONObject.class);
+                verify(callback).error(error.capture());
+                check(error.getValue().getString("error").equals("USB printer is busy"), "busy uses error callback");
+                verifyNoMoreInteractions(callback);
+                check(printers.constructed().isEmpty(), "busy action never constructs a printer");
+                verify(f.manager, never()).openDevice(any());
+                verify(f.writer, never()).disconnect();
+            }
+
+            // The status handle closes before a subsequent action may construct its writer. While that
+            // constructor runs, a concurrent status call must return busy without touching the writer.
+            f.status();
+            verify(f.handle).close();
+            try (MockedStatic<Base64> base64 = mockStatic(Base64.class);
+                 MockedStatic<BitmapFactory> bitmaps = mockStatic(BitmapFactory.class);
+                 MockedStatic<PrinterTextParserImg> images = mockStatic(PrinterTextParserImg.class);
+                 MockedConstruction<EscPosPrinter> printers = mockConstruction(EscPosPrinter.class, (printer, context) -> {
+                     check(lock.isHeldByCurrentThread(), "writer constructor runs under the USB lock");
+                     JSONObject busy = CompletableFuture.supplyAsync(f::status).get(2, TimeUnit.SECONDS);
+                     check(busy.getString("reason").equals("busy"), "status cannot run during writer construction");
+                 })) {
+                byte[] bytes = { 0 };
+                Bitmap bitmap = mock(Bitmap.class);
+                base64.when(() -> Base64.decode("AA==", Base64.DEFAULT)).thenReturn(bytes);
+                bitmaps.when(() -> BitmapFactory.decodeByteArray(bytes, 0, 1)).thenReturn(bitmap);
+                images.when(() -> PrinterTextParserImg.bitmapToHexadecimalString(any(EscPosPrinter.class), eq(bitmap)))
+                    .thenReturn("ABCD");
+                CallbackContext callback = mock(CallbackContext.class);
+                f.plugin.execute(action, new JSONArray().put(printData().put("base64", "AA==")), callback);
+                check(printers.constructed().size() == 1, "writer action resumes after status");
+                if (action.equals("bitmapToHexadecimalString")) verify(callback).success("ABCD");
+                else verify(callback).success("null");
+                check(!lock.isLocked(), "writer action releases its lock");
+            }
+        }
+
+        Fixture recovery = new Fixture(0x12, 0x12);
+        recovery.cache.remove("usb-123"); // Kiosk prints with stable identifiers, disconnects using only id.
+        recovery.cache.put("usb-alias", recovery.writer);
+        UsbConnection other = mock(UsbConnection.class);
+        UsbDevice otherDevice = usbDevice(999, "/dev/bus/usb/other");
+        when(other.getDevice()).thenReturn(otherDevice);
+        recovery.cache.put("usb-other", other);
+        when(recovery.manager.getDeviceList()).thenReturn(new HashMap<>()); // Also works after detach.
+        try (HeldUsbLock held = new HeldUsbLock(usbLock(recovery));
+             MockedConstruction<EscPosPrinter> printers = mockConstruction(EscPosPrinter.class)) {
+            for (int i = 0; i < 2; i++) {
+                CallbackContext callback = mock(CallbackContext.class);
+                long start = System.nanoTime();
+                recovery.plugin.execute("disconnectPrinter", new JSONArray().put(new JSONObject()
+                    .put("type", "usb").put("id", "123")), callback);
+                check(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) < 1000, "recovery never waits for the writer lock");
+                verify(callback).success();
+                verifyNoMoreInteractions(callback);
+            }
+            verify(recovery.writer).disconnect();
+            verify(other, never()).disconnect();
+            check(recovery.cache.size() == 1 && recovery.cache.get("usb-other") == other, "recovery clears only the selected writer's aliases");
+            check(printers.constructed().isEmpty(), "disconnect never opens a printer");
+            verify(recovery.manager, never()).openDevice(any());
+        }
+
+        // Permissions remain available for kiosk rediscovery while a write is stuck. They resolve the
+        // USB device, register the permission callback and never open or insert a cached writer.
+        for (boolean granted : new boolean[] { true, false }) {
+            Fixture f = new Fixture(0x12, 0x12);
+            f.cache.clear();
+            try (HeldUsbLock held = new HeldUsbLock(usbLock(f));
+                 MockedConstruction<Intent> intents = mockConstruction(Intent.class);
+                 MockedConstruction<IntentFilter> filters = mockConstruction(IntentFilter.class);
+                 MockedStatic<PendingIntent> pending = mockStatic(PendingIntent.class)) {
+                CallbackContext callback = mock(CallbackContext.class);
+                f.plugin.execute("requestPermissions", new JSONArray().put(printData()), callback);
+                verify(f.manager).requestPermission(eq(f.device), isNull());
+                verify(f.manager, never()).openDevice(any());
+                check(f.cache.isEmpty(), "permissions do not cache a writer");
+                ArgumentCaptor<BroadcastReceiver> receiver = ArgumentCaptor.forClass(BroadcastReceiver.class);
+                verify(f.plugin.cordova.getActivity()).registerReceiver(receiver.capture(), any(IntentFilter.class));
+                Intent reply = mock(Intent.class);
+                when(reply.getAction()).thenReturn("thermalPrinterUSBRequest-usb-1208-3623");
+                when(reply.getParcelableExtra(UsbManager.EXTRA_DEVICE)).thenReturn(f.device);
+                when(reply.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)).thenReturn(granted);
+                receiver.getValue().onReceive(f.plugin.cordova.getActivity(), reply);
+                ArgumentCaptor<JSONObject> result = ArgumentCaptor.forClass(JSONObject.class);
+                if (granted) verify(callback).success(result.capture());
+                else verify(callback).error(result.capture());
+                check(result.getValue().getBoolean("granted") == granted, "permission callback contract preserved");
+                verifyNoMoreInteractions(callback);
+            }
+        }
     }
 
     private static void integrationChecks() throws Exception {
@@ -572,6 +816,24 @@ public class UsbPrinterStatusTest {
                 ((byte[]) call.getArgument(1))[0] = (byte) reply;
                 return 1;
             });
+        }
+
+        void portStatus(int value, int count) {
+            // Nonzero interface id catches accidental use of interface index zero in wIndex.
+            when(usbInterface.getId()).thenReturn(7);
+            when(handle.controlTransfer(anyInt(), anyInt(), anyInt(), anyInt(), any(byte[].class), anyInt(), anyInt()))
+                .thenAnswer(call -> {
+                    check(commands.isEmpty(), "class source is queried before DLE EOT");
+                    check((int) call.getArgument(0) == 0xA1 && (int) call.getArgument(1) == 1
+                        && (int) call.getArgument(2) == 0 && (int) call.getArgument(3) == 7,
+                        "GET_PORT_STATUS request targets the selected printer interface");
+                    byte[] buffer = call.getArgument(4);
+                    check(buffer.length == 1 && (int) call.getArgument(5) == 1, "class query requests one byte");
+                    int timeout = call.getArgument(6);
+                    check(timeout > 0 && timeout <= TRANSFER_TIMEOUT_MS, "class transfer has a bounded timeout");
+                    buffer[0] = (byte) value;
+                    return count;
+                });
         }
 
         JSONObject status() {

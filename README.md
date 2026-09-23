@@ -280,6 +280,10 @@ Get the printer encoding when available
 
 Close the connection with the printer
 
+For USB, this closes existing cached connections only; it never opens a new connection. It remains
+available while a print is blocked, and succeeds if there is nothing left to close. A `type`/`id`
+selector also finds a connection cached under stable USB identifiers. Other printers are preserved.
+
 | Param           | Type                                                                                               | Description                                                                                |
 | --------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | data            | <code>Array.&lt;Object&gt;</code>                                                                  | Data object                                                                                |
@@ -347,11 +351,13 @@ receive buffer is full, which is itself a sign that it is offline.
 Malformed arguments use the error callback. Partial results are possible: paper may be known
 while cover is `null`. A timeout cannot establish whether the printer supports the command.
 
-Printing is serialized against status queries. Only `printFormattedText*` takes the USB lock, and it
-takes it with a bounded wait: discovery, disconnect, diagnostics and image conversion stay outside it,
-because a native write blocks in `requestWait()` with no deadline and holding those behind a wedged
-print leaves the OTG recovery with no way back. A query returns `busy` immediately if a print
-holds the lock or is waiting. Otherwise it releases cached printing connections for
+Printing, `getEncoding` and `bitmapToHexadecimalString` are serialized against status queries because
+they open USB writers. They wait at most 5000 ms for the lock, then use the error callback with
+`{ error: "USB printer is busy", type: "PRINT_ERROR" }`. Discovery, permissions and diagnostics do not
+open writers. USB disconnect only closes cached connections and stays outside the lock so recovery
+can close a blocked native write. Permission requests do not create cache entries.
+A query returns `busy` immediately if a writer action holds the lock or is waiting.
+Otherwise it releases cached printing connections for
 the selected device, opens a temporary connection, claims the same printer interface with
 `force=false`, retrying and forcing only on the last attempt, and always closes it before allowing
 another operation. The next print reconnects
