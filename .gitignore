@@ -2,3 +2,5 @@
 /node_modules
 /dist
 /src/android/.gradle
+/src/android/build
+.ia-temp/

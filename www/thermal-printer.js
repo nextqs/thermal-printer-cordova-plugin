@@ -2,6 +2,18 @@
 
 module.exports = {
   /**
+   * Query ESC/POS paper and cover sensors over USB (experimental, since v1.2.0).
+   * Unknown sensor values are null; a missing reply must not prevent ticket issuance.
+   *
+   * @param {Object} data - USB selector: type, id, optional vendorId/productId/serialNumber
+   * @param {function} successCallback - Snapshot, including unknown/unsupported/busy states
+   * @param {function} errorCallback - Invalid arguments or bridge failure
+   */
+  getPrinterStatus: function (data, successCallback, errorCallback) {
+    cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'getPrinterStatus', [data]);
+  },
+
+  /**
    * List available printers
    *
    * @param {Object} data - Data object
@@ -11,6 +23,26 @@ module.exports = {
    */
   listPrinters: function (data, successCallback, errorCallback) {
     cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'listPrinters', [data]);
+  },
+
+  /**
+   * USB/power diagnostics: UsbManager devices, connection cache, USB_STATE, battery and recent events
+   *
+   * @param {function} successCallback - Result on success
+   * @param {function} errorCallback - Result on failure
+   */
+  getUsbDiagnostics: function (successCallback, errorCallback) {
+    cordova.exec(successCallback, errorCallback, 'ThermalPrinter', 'getUsbDiagnostics', []);
+  },
+
+  /**
+   * Stream USB attach/detach, USB_STATE, power and screen events (callback is kept and called for every event)
+   *
+   * @param {function} eventCallback - Called with each event
+   * @param {function} errorCallback - Result on failure
+   */
+  onUsbEvent: function (eventCallback, errorCallback) {
+    cordova.exec(eventCallback, errorCallback, 'ThermalPrinter', 'registerUsbEventListener', []);
   },
 
   /**

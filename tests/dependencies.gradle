@@ -1,0 +1,23 @@
+repositories {
+    google()
+    mavenCentral()
+    maven { url = uri('https://jitpack.io') }
+}
+
+configurations {
+    testRuntime
+}
+
+dependencies {
+    testRuntime 'com.github.nextqs:ESCPOS-ThermalPrinter-Android:3.6.0'
+    testRuntime 'org.apache.cordova:framework:14.0.1'
+    testRuntime 'com.google.zxing:core:3.4.0'
+    testRuntime 'org.json:json:20250517'
+    testRuntime 'org.mockito:mockito-core:5.20.0'
+}
+
+tasks.register('resolveTestDependencies') {
+    doLast {
+        configurations.testRuntime.files.each { file -> println file.name }
+    }
+}

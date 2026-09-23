@@ -12,6 +12,7 @@ export interface Printer {
     deviceId?: number;
     serialNumber?: string;
     vendorId?: number;
+    productId?: number;
 
     // Internal Android printer (Gertec GPOS820 / Urovo-compatible runtime)
     id?: string;
@@ -26,6 +27,10 @@ export interface PrinterToUse {
     id: string | number;
     address?: string;
     port?: number;
+    /** Stable USB identifiers used after the device re-enumerates. */
+    vendorId?: number;
+    productId?: number;
+    serialNumber?: string;
 }
 
 export interface PrintFormattedText extends PrinterToUse {
@@ -115,7 +120,123 @@ export interface ErrorResult {
     error?: string;
 }
 
+/**
+ * Available since v1.2.0 — shapes returned by getUsbDiagnostics() and onUsbEvent().
+ */
+
+export interface UsbEndpointInfo {
+    address: number;
+    /** UsbConstants.USB_ENDPOINT_XFER_* */
+    type: number;
+    direction: 'in' | 'out';
+    maxPacketSize: number;
+}
+
+export interface UsbInterfaceInfo {
+    id: number;
+    class: number;
+    subclass: number;
+    protocol: number;
+    endpoints: UsbEndpointInfo[];
+}
+
+export interface UsbDeviceInfo {
+    deviceName: string;
+    /** Changes every time the device re-enumerates on the bus */
+    deviceId: number;
+    vendorId: number;
+    productId: number;
+    deviceClass: number;
+    interfaceCount: number;
+    interfaces: UsbInterfaceInfo[];
+    productName?: string;
+    manufacturerName?: string;
+    /** Only reported by getUsbDiagnostics(), not by the event stream */
+    hasPermission?: boolean;
+    /** Only reported by getUsbDiagnostics(), and only when readable */
+    serialNumber?: string;
+}
+
+export interface UsbPowerState {
+    /** BatteryManager.EXTRA_PLUGGED: 0 when unplugged, -1 when unknown */
+    plugged?: number;
+    pluggedLabel?: 'ac' | 'usb' | 'wireless' | 'unplugged' | 'other';
+    /** BatteryManager.EXTRA_STATUS */
+    status?: number;
+    levelPercent?: number;
+    voltageMv?: number;
+}
+
+export interface UsbEvent {
+    timestamp?: number;
+    uptimeMs?: number;
+    /** e.g. android.hardware.usb.action.USB_DEVICE_ATTACHED, android.intent.action.POWER_CONNECTED */
+    action?: string;
+    /** Present on attach/detach only */
+    device?: UsbDeviceInfo;
+    /** Sticky USB_STATE extras, stringified. Present on USB_STATE only */
+    extras?: { [key: string]: string | null };
+    power?: UsbPowerState;
+    /** Number of devices reported by UsbManager, or -1 when unavailable */
+    usbDeviceCount?: number;
+}
+
+export interface UsbConnectionCacheEntry {
+    key: string;
+    isConnected: boolean;
+    deviceName?: string;
+    deviceId?: number;
+}
+
+export interface UsbDiagnostics {
+    timestamp?: number;
+    uptimeMs?: number;
+    /** Manufacturer, model, SDK level and build */
+    device?: string;
+    /** False when the USB/power receiver failed to register: the connection cache is then only cleared on detach and on print failure */
+    receiverRegistered?: boolean;
+    eventListenerAttached?: boolean;
+    verboseLogging?: boolean;
+    power?: UsbPowerState;
+    usbState?: { [key: string]: string | null };
+    usbDevices?: UsbDeviceInfo[];
+    connectionCache?: UsbConnectionCacheEntry[];
+    recentEvents?: UsbEvent[];
+}
+
+export interface GetPrinterStatus extends PrinterToUse {
+    type: 'usb';
+}
+
+export type PrinterStatusReason = 'unsupported_transport' | 'busy' | 'device_not_found'
+    | 'permission_required' | 'no_status_endpoint' | 'interface_unavailable'
+    | 'input_not_quiet' | 'timeout' | 'write_timeout' | 'invalid_response' | 'io_error' | 'partial';
+
+/** Experimental ESC/POS USB snapshot; null always means unknown, never a printer fault. */
+export interface PrinterStatus {
+    /** True when at least one valid USB class or DLE EOT reply was received; null when support is unknown. */
+    supported: boolean | null;
+    /** Decoded independently from the available paper source; null means it was not established. */
+    paperPresent: boolean | null;
+    /** Requires a near-end sensor on the printer. */
+    paperNearEnd: boolean | null;
+    /** Requires the model to implement the standard offline-status cover bit. */
+    coverOpen: boolean | null;
+    /** USB printer class error bit: the printer stopped, without saying why. Blocks printing. */
+    printerStopped: boolean | null;
+    /** Raw unsigned bytes, including malformed replies; empty arrays mean no reply was read. */
+    raw: { paper: number[]; offline: number[]; port: number[]; };
+    reason: PrinterStatusReason | null;
+}
+
 export interface ThermalPrinterPlugin {
+  /**
+   * Query paper/cover sensors over USB. Available since v1.2.0; validate each model on the bench.
+   * Busy, absent, unsupported and silent printers use the success callback with unknown fields.
+   * Never block ticket issuance on null fields or supported !== true.
+   */
+  getPrinterStatus?(data: GetPrinterStatus, success: (value: PrinterStatus) => void, error: (value: ErrorResult) => void): void;
+
   /**
    * List available printers
    *
@@ -185,6 +306,28 @@ export interface ThermalPrinterPlugin {
    * @param {function} error
    */
   disconnectPrinter(data: PrinterToUse, success: () => void, error: (value: ErrorResult) => void);
+
+  /**
+   * USB/power diagnostics: UsbManager devices, connection cache, USB_STATE, battery and recent events
+   *
+   * Available since v1.2.0. Optional so that code written against 1.1.0 keeps type-checking; guard with
+   * `typeof ThermalPrinter.getUsbDiagnostics === 'function'` when the plugin version is not pinned.
+   *
+   * @param {function} success
+   * @param {function} error
+   */
+  getUsbDiagnostics?(success: (value: UsbDiagnostics) => void, error: (value: ErrorResult) => void): void;
+
+  /**
+   * Stream USB attach/detach, USB_STATE, power and screen events. The success callback is called for every event.
+   *
+   * Available since v1.2.0. Optional for the same reason as getUsbDiagnostics. Calling it again replaces the
+   * previous subscription, so subscribe once.
+   *
+   * @param {function} success
+   * @param {function} error
+   */
+  onUsbEvent?(success: (event: UsbEvent) => void, error: (value: ErrorResult) => void): void;
 
   /**
    * Request permissions for USB printers
